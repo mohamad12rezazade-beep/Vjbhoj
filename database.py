@@ -1,49 +1,50 @@
-import asyncpg
 import json
+import asyncpg
 from config import DATABASE_URL
 
-pool = None
+_pool = None
 
 
 async def connect_db():
-    global pool
+    global _pool
 
-    if pool is None:
-        pool = await asyncpg.create_pool(
+    if _pool is None:
+        _pool = await asyncpg.create_pool(
             DATABASE_URL,
             min_size=1,
             max_size=10,
-            ssl="require"
+            ssl="require",
+            command_timeout=30
         )
+
+    return _pool
 
 
 async def close_db():
-    global pool
+    global _pool
 
-    if pool:
-        await pool.close()
-        pool = None
+    if _pool is not None:
+        await _pool.close()
+        _pool = None
 
 
-# =========================
-# USERS
-# =========================
+def get_pool():
+    if _pool is None:
+        raise RuntimeError("Database is not connected")
+
+    return _pool
+
 
 async def save_user(user_id, username=None, first_name=None):
-    async with pool.acquire() as conn:
-        await conn.execute("""
-            INSERT INTO users (user_id, username, first_name)
-            VALUES ($1, $2, $3)
-            ON CONFLICT (user_id)
-            DO UPDATE SET
-                username = EXCLUDED.username,
-                first_name = EXCLUDED.first_name
-        """, user_id, username, first_name)
+    await get_pool().execute("""
+        INSERT INTO users (user_id, username, first_name)
+        VALUES ($1, $2, $3)
+        ON CONFLICT (user_id)
+        DO UPDATE SET
+            username = EXCLUDED.username,
+            first_name = EXCLUDED.first_name
+    """, user_id, username, first_name)
 
-
-# =========================
-# GIVEAWAYS
-# =========================
 
 async def create_giveaway(
     creator_id,
@@ -57,8 +58,14 @@ async def create_giveaway(
     post_text,
     required_channels
 ):
-    async with pool.acquire() as conn:
+    async with get_pool().acquire() as conn:
         async with conn.transaction():
+
+            await conn.execute("""
+                INSERT INTO users (user_id)
+                VALUES ($1)
+                ON CONFLICT (user_id) DO NOTHING
+            """, creator_id)
 
             giveaway_id = await conn.fetchval("""
                 INSERT INTO giveaways (
@@ -75,7 +82,7 @@ async def create_giveaway(
                     ends_at
                 )
                 VALUES (
-                    $1,$2,$3::jsonb,$4,$5,$6,$7,$8,$9,
+                    $1, $2, $3::jsonb, $4, $5, $6, $7, $8, $9,
                     'active',
                     NOW() + ($6 * INTERVAL '1 hour')
                 )
@@ -83,12 +90,12 @@ async def create_giveaway(
             """,
                 creator_id,
                 winner_count,
-                json.dumps(prizes),
+                json.dumps(prizes, ensure_ascii=False),
                 min_users,
                 max_users,
                 duration,
                 mode,
-                target_channel,
+                str(target_channel),
                 post_text
             )
 
@@ -100,82 +107,65 @@ async def create_giveaway(
                         title,
                         invite_link
                     )
-                    VALUES ($1,$2,$3,$4)
+                    VALUES ($1, $2, $3, $4)
+                    ON CONFLICT (giveaway_id, chat_id)
+                    DO UPDATE SET
+                        title = EXCLUDED.title,
+                        invite_link = EXCLUDED.invite_link
                 """,
                     giveaway_id,
-                    channel["chat_id"],
-                    channel["title"],
-                    channel["invite_link"]
+                    str(channel["chat_id"]),
+                    channel.get("title"),
+                    channel.get("invite_link")
                 )
 
             return giveaway_id
 
 
 async def get_giveaway(giveaway_id):
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow("""
-            SELECT * FROM giveaways WHERE id = $1
-        """, giveaway_id)
-
-        return dict(row) if row else None
+    return await get_pool().fetchrow("""
+        SELECT * FROM giveaways WHERE id = $1
+    """, giveaway_id)
 
 
 async def get_active_giveaways():
-    async with pool.acquire() as conn:
-        rows = await conn.fetch("""
-            SELECT * FROM giveaways
-            WHERE status = 'active'
-            ORDER BY created_at DESC
-        """)
-
-        return [dict(row) for row in rows]
+    return await get_pool().fetch("""
+        SELECT * FROM giveaways
+        WHERE status = 'active'
+        ORDER BY ends_at ASC
+    """)
 
 
 async def get_user_giveaways(user_id):
-    async with pool.acquire() as conn:
-        rows = await conn.fetch("""
-            SELECT * FROM giveaways
-            WHERE creator_id = $1
-            ORDER BY created_at DESC
-        """, user_id)
+    return await get_pool().fetch("""
+        SELECT * FROM giveaways
+        WHERE creator_id = $1
+        ORDER BY created_at DESC
+    """, user_id)
 
-        return [dict(row) for row in rows]
-
-
-# =========================
-# CHANNELS
-# =========================
 
 async def get_required_channels(giveaway_id):
-    async with pool.acquire() as conn:
-        rows = await conn.fetch("""
-            SELECT * FROM required_channels
-            WHERE giveaway_id = $1
-        """, giveaway_id)
-
-        return [dict(row) for row in rows]
+    return await get_pool().fetch("""
+        SELECT * FROM required_channels
+        WHERE giveaway_id = $1
+    """, giveaway_id)
 
 
-# =========================
-# PARTICIPANTS
-# =========================
-
-async def add_participant(
-    giveaway_id,
-    user_id,
-    referrer_id=None
-):
-    async with pool.acquire() as conn:
+async def add_participant(giveaway_id, user_id, referrer_id=None):
+    async with get_pool().acquire() as conn:
         async with conn.transaction():
 
             giveaway = await conn.fetchrow("""
                 SELECT * FROM giveaways
-                WHERE id = $1 AND status = 'active'
+                WHERE id = $1
                 FOR UPDATE
             """, giveaway_id)
 
-            if not giveaway:
-                return False
+            if not giveaway or giveaway["status"] != "active":
+                return False, "ended"
+
+            if giveaway["ends_at"] <= await conn.fetchval("SELECT NOW()"):
+                return False, "ended"
 
             existing = await conn.fetchval("""
                 SELECT 1 FROM participants
@@ -183,7 +173,7 @@ async def add_participant(
             """, giveaway_id, user_id)
 
             if existing:
-                return False
+                return False, "already_joined"
 
             count = await conn.fetchval("""
                 SELECT COUNT(*) FROM participants
@@ -191,7 +181,26 @@ async def add_participant(
             """, giveaway_id)
 
             if count >= giveaway["max_users"]:
-                return False
+                return False, "full"
+
+            await conn.execute("""
+                INSERT INTO users (user_id)
+                VALUES ($1)
+                ON CONFLICT (user_id) DO NOTHING
+            """, user_id)
+
+            valid_referrer = None
+
+            if referrer_id and referrer_id != user_id:
+                is_valid = await conn.fetchval("""
+                    SELECT 1 FROM participants
+                    WHERE giveaway_id = $1
+                      AND user_id = $2
+                      AND active = TRUE
+                """, giveaway_id, referrer_id)
+
+                if is_valid:
+                    valid_referrer = referrer_id
 
             await conn.execute("""
                 INSERT INTO participants (
@@ -201,110 +210,82 @@ async def add_participant(
                     referral_count,
                     referred_by
                 )
-                VALUES ($1,$2,TRUE,0,$3)
-            """, giveaway_id, user_id, referrer_id)
+                VALUES ($1, $2, TRUE, 0, $3)
+            """, giveaway_id, user_id, valid_referrer)
 
-            if referrer_id and referrer_id != user_id:
+            if valid_referrer:
+                inserted = await conn.fetchval("""
+                    INSERT INTO referrals (
+                        giveaway_id,
+                        referrer_id,
+                        referred_user_id
+                    )
+                    VALUES ($1, $2, $3)
+                    ON CONFLICT DO NOTHING
+                    RETURNING referred_user_id
+                """, giveaway_id, valid_referrer, user_id)
 
-                referrer_exists = await conn.fetchval("""
-                    SELECT 1 FROM participants
-                    WHERE giveaway_id = $1
-                    AND user_id = $2
-                    AND active = TRUE
-                """, giveaway_id, referrer_id)
+                if inserted:
+                    await conn.execute("""
+                        UPDATE participants
+                        SET referral_count = referral_count + 1
+                        WHERE giveaway_id = $1 AND user_id = $2
+                    """, giveaway_id, valid_referrer)
 
-                if referrer_exists:
-                    result = await conn.execute("""
-                        INSERT INTO referrals (
-                            giveaway_id,
-                            referrer_id,
-                            referred_user_id
-                        )
-                        VALUES ($1,$2,$3)
-                        ON CONFLICT DO NOTHING
-                    """, giveaway_id, referrer_id, user_id)
-
-                    if result.endswith("1"):
-                        await conn.execute("""
-                            UPDATE participants
-                            SET referral_count = referral_count + 1
-                            WHERE giveaway_id = $1
-                            AND user_id = $2
-                        """, giveaway_id, referrer_id)
-
-            return True
+            return True, "joined"
 
 
 async def get_participants(giveaway_id):
-    async with pool.acquire() as conn:
-        rows = await conn.fetch("""
-            SELECT * FROM participants
-            WHERE giveaway_id = $1
-            AND active = TRUE
-        """, giveaway_id)
+    return await get_pool().fetch("""
+        SELECT * FROM participants
+        WHERE giveaway_id = $1 AND active = TRUE
+    """, giveaway_id)
 
-        return [dict(row) for row in rows]
-
-
-# =========================
-# WINNERS
-# =========================
 
 async def save_winners(giveaway_id, winners):
-    async with pool.acquire() as conn:
+    async with get_pool().acquire() as conn:
         async with conn.transaction():
-            for winner in winners:
+            await conn.execute("""
+                DELETE FROM winners WHERE giveaway_id = $1
+            """, giveaway_id)
+
+            for position, winner in enumerate(winners, start=1):
                 await conn.execute("""
                     INSERT INTO winners (
                         giveaway_id,
                         user_id,
-                        position,
-                        prize
+                        position
                     )
-                    VALUES ($1,$2,$3,$4)
+                    VALUES ($1, $2, $3)
                     ON CONFLICT DO NOTHING
-                """,
-                    giveaway_id,
-                    winner["user_id"],
-                    winner["position"],
-                    winner["prize"]
-                )
+                """, giveaway_id, winner["user_id"], position)
 
 
 async def get_winners(giveaway_id):
-    async with pool.acquire() as conn:
-        rows = await conn.fetch("""
-            SELECT * FROM winners
-            WHERE giveaway_id = $1
-            ORDER BY position
-        """, giveaway_id)
+    return await get_pool().fetch("""
+        SELECT w.*, p.referral_count
+        FROM winners w
+        LEFT JOIN participants p
+          ON p.giveaway_id = w.giveaway_id
+         AND p.user_id = w.user_id
+        WHERE w.giveaway_id = $1
+        ORDER BY w.position
+    """, giveaway_id)
 
-        return [dict(row) for row in rows]
-
-
-# =========================
-# FINISH GIVEAWAY
-# =========================
 
 async def finish_giveaway(giveaway_id):
-    async with pool.acquire() as conn:
-        result = await conn.execute("""
-            UPDATE giveaways
-            SET status = 'ended'
-            WHERE id = $1 AND status = 'active'
-        """, giveaway_id)
+    return await get_pool().fetchrow("""
+        UPDATE giveaways
+        SET status = 'ended'
+        WHERE id = $1 AND status = 'active'
+        RETURNING *
+    """, giveaway_id)
 
-        return result.endswith("1")
-
-
-# =========================
-# CANCEL GIVEAWAY
-# =========================
 
 async def cancel_giveaway(giveaway_id):
-    async with pool.acquire() as conn:
-        await conn.execute("""
-            UPDATE giveaways
-            SET status = 'cancelled'
-            WHERE id = $1 AND status = 'active'
-        """, giveaway_id)
+    return await get_pool().fetchrow("""
+        UPDATE giveaways
+        SET status = 'cancelled'
+        WHERE id = $1 AND status = 'active'
+        RETURNING *
+    """, giveaway_id)
