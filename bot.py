@@ -2,6 +2,7 @@ import asyncio
 import logging
 import random
 import json
+import re
 
 from datetime import datetime, timezone
 
@@ -11,12 +12,13 @@ from aiogram.types import (
     Message,
     CallbackQuery,
     InlineKeyboardMarkup,
-    InlineKeyboardButton,
+    InlineKeyboardButton
 )
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
 
-from config import BOT_TOKEN
+from config import BOT_TOKEN, ADMIN_IDS
+
 from database import (
     connect_db,
     close_db,
@@ -28,19 +30,14 @@ from database import (
     get_required_channels,
     add_participant,
     get_participants,
-    get_winners,
     save_winners,
+    get_winners,
     finish_giveaway,
-    cancel_giveaway,
+    cancel_giveaway
 )
 
-from keyboards import main_menu, giveaway_keyboard
 from states import CreateGiveaway
 
-
-# =========================
-# تنظیمات
-# =========================
 
 logging.basicConfig(level=logging.INFO)
 
@@ -48,89 +45,90 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
 
-# =========================
-# کیبوردها
-# =========================
+# =====================================
+# KEYBOARDS
+# =====================================
 
-def cancel_keyboard():
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="❌ لغو ساخت",
-                    callback_data="cancel_creation"
-                )
-            ]
+def main_menu():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(
+                text="🎁 ساخت قرعه‌کشی",
+                callback_data="create"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="📋 قرعه‌کشی‌های فعال",
+                callback_data="active"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="👤 قرعه‌کشی‌های من",
+                callback_data="mine"
+            )
         ]
-    )
+    ])
 
 
-def verify_keyboard(giveaway_id):
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="✅ بررسی عضویت",
-                    callback_data=f"verify_{giveaway_id}"
-                )
-            ]
+def giveaway_keyboard(giveaway_id):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(
+                text="🎉 شرکت در قرعه‌کشی",
+                callback_data=f"join_{giveaway_id}"
+            )
         ]
-    )
+    ])
 
 
-def management_keyboard(giveaway_id):
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
+def channel_keyboard(channels, giveaway_id):
+    buttons = []
+
+    for channel in channels:
+        if channel["invite_link"]:
+            buttons.append([
                 InlineKeyboardButton(
-                    text="📊 آمار شرکت‌کنندگان",
-                    callback_data=f"stats_{giveaway_id}"
+                    text=f"عضویت در {channel['title'] or 'کانال'}",
+                    url=channel["invite_link"]
                 )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🏆 مشاهده برندگان",
-                    callback_data=f"winners_{giveaway_id}"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="❌ لغو قرعه‌کشی",
-                    callback_data=f"cancel_gw_{giveaway_id}"
-                )
-            ]
-        ]
-    )
+            ])
+
+    buttons.append([
+        InlineKeyboardButton(
+            text="✅ بررسی عضویت",
+            callback_data=f"verify_{giveaway_id}"
+        )
+    ])
+
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
-# =========================
-# ابزار کانال
-# =========================
+# =====================================
+# HELPERS
+# =====================================
+
+def is_admin(user_id):
+    return user_id in ADMIN_IDS
+
 
 async def check_bot_admin(chat_id):
     try:
-        me = await bot.get_me()
-        member = await bot.get_chat_member(chat_id, me.id)
-
-        return member.status in (
-            "administrator",
-            "creator"
-        )
-
+        member = await bot.get_chat_member(chat_id, bot.id)
+        return member.status in ("administrator", "creator")
     except Exception:
+        logging.exception("Could not check bot admin status")
         return False
 
 
-async def get_channel_information(chat_id):
-    chat = await bot.get_chat(chat_id)
+async def get_channel_information(channel):
+    chat = await bot.get_chat(channel)
 
     if chat.username:
         invite_link = f"https://t.me/{chat.username}"
-
     else:
-        invite = await bot.create_chat_invite_link(
-            chat_id=chat.id
-        )
+        invite = await bot.create_chat_invite_link(chat.id)
         invite_link = invite.invite_link
 
     return {
@@ -142,10 +140,7 @@ async def get_channel_information(chat_id):
 
 async def is_user_member(user_id, chat_id):
     try:
-        member = await bot.get_chat_member(
-            chat_id,
-            user_id
-        )
+        member = await bot.get_chat_member(chat_id, user_id)
 
         return member.status in (
             "member",
@@ -154,12 +149,20 @@ async def is_user_member(user_id, chat_id):
         )
 
     except Exception:
+        logging.exception("Membership check failed")
         return False
 
 
-# =========================
-# شروع ربات
-# =========================
+def parse_integer(text):
+    try:
+        return int(text.strip())
+    except (ValueError, AttributeError):
+        return None
+
+
+# =====================================
+# START
+# =====================================
 
 @dp.message(CommandStart())
 async def start_handler(message: Message, state: FSMContext):
@@ -169,436 +172,349 @@ async def start_handler(message: Message, state: FSMContext):
     user = message.from_user
 
     await save_user(
-        user_id=user.id,
-        username=user.username,
-        first_name=user.first_name
+        user.id,
+        user.username,
+        user.first_name
     )
 
-    args = message.text.split(maxsplit=1)
+    referrer_id = None
 
-    if len(args) > 1:
+    parts = message.text.split(maxsplit=1)
 
-        payload = args[1]
+    if len(parts) > 1:
+        match = re.fullmatch(
+            r"gw_(\d+)_ref_(\d+)",
+            parts[1].strip()
+        )
 
-        if payload.startswith("gw_"):
+        if match:
+            giveaway_id = int(match.group(1))
+            referrer_id = int(match.group(2))
 
-            try:
-                parts = payload.split("_")
-
-                giveaway_id = int(parts[1])
-                referrer_id = None
-
-                if len(parts) == 4 and parts[2] == "ref":
-                    referrer_id = int(parts[3])
-
-                giveaway = await get_giveaway(giveaway_id)
-
-                if giveaway and giveaway["status"] == "active":
-
-                    await state.update_data(
-                        pending_giveaway_id=giveaway_id,
-                        pending_referrer_id=referrer_id
-                    )
-
-                    await message.answer(
-                        "🎁 برای شرکت در این قرعه‌کشی "
-                        "روی دکمه زیر بزن.",
-                        reply_markup=giveaway_keyboard(
-                            giveaway_id
-                        )
-                    )
-
-                    return
-
-            except Exception:
-                logging.exception("Deep link error")
+            await state.update_data(
+                pending_giveaway_id=giveaway_id,
+                pending_referrer_id=referrer_id
+            )
 
     await message.answer(
-        "سلام 👋\n\n"
-        "به ربات مدیریت قرعه‌کشی خوش اومدی.\n"
-        "از منوی زیر استفاده کن:",
+        "سلام! به ربات قرعه‌کشی خوش اومدی 🎉",
         reply_markup=main_menu()
     )
 
 
-# =========================
-# بازگشت به منو
-# =========================
+# =====================================
+# CREATE GIVEAWAY
+# =====================================
 
-@dp.callback_query(F.data == "back_home")
-async def back_home(callback: CallbackQuery, state: FSMContext):
-
-    await state.clear()
-
-    await callback.message.answer(
-        "منوی اصلی:",
-        reply_markup=main_menu()
-    )
-
-    await callback.answer()
-
-
-# =========================
-# ساخت قرعه‌کشی
-# =========================
-
-@dp.callback_query(F.data == "create_giveaway")
+@dp.callback_query(F.data == "create")
 async def create_start(callback: CallbackQuery, state: FSMContext):
 
-    await state.clear()
+    if not is_admin(callback.from_user.id):
+        await callback.answer("اجازه ساخت قرعه‌کشی نداری.", show_alert=True)
+        return
 
-    await state.set_state(
-        CreateGiveaway.winner_count
-    )
+    await state.clear()
+    await state.set_state(CreateGiveaway.winner_count)
 
     await callback.message.answer(
-        "🏆 چند نفر برنده داشته باشیم؟"
+        "تعداد برنده‌ها رو وارد کن:"
     )
 
     await callback.answer()
 
 
 @dp.message(CreateGiveaway.winner_count)
-async def get_winner_count(message: Message, state: FSMContext):
+async def winner_count_handler(message: Message, state: FSMContext):
 
-    try:
-        count = int(message.text)
+    value = parse_integer(message.text)
 
-        if count < 1 or count > 100:
-            raise ValueError
-
-    except Exception:
-        await message.answer(
-            "❌ یک عدد بین 1 تا 100 وارد کن."
-        )
+    if value is None or value < 1 or value > 100:
+        await message.answer("یک عدد بین ۱ تا ۱۰۰ وارد کن.")
         return
 
-    await state.update_data(
-        winner_count=count,
-        prizes=[]
-    )
-
-    await state.set_state(
-        CreateGiveaway.prizes
-    )
+    await state.update_data(winner_count=value)
+    await state.set_state(CreateGiveaway.prizes)
 
     await message.answer(
-        "🎁 جایزه نفر اول رو وارد کن."
+        "جایزه هر رتبه رو وارد کن.\n"
+        "مثال:\n"
+        "رتبه اول: ۱۰۰ هزار تومان\n"
+        "رتبه دوم: ۵۰ هزار تومان"
     )
 
 
 @dp.message(CreateGiveaway.prizes)
-async def get_prizes(message: Message, state: FSMContext):
+async def prizes_handler(message: Message, state: FSMContext):
+
+    text = message.text.strip()
+
+    prizes = [
+        line.strip()
+        for line in text.splitlines()
+        if line.strip()
+    ]
 
     data = await state.get_data()
 
-    prizes = data.get("prizes", [])
-
-    prizes.append(message.text.strip())
-
-    if len(prizes) < data["winner_count"]:
-
-        await state.update_data(prizes=prizes)
-
+    if len(prizes) != data["winner_count"]:
         await message.answer(
-            f"🎁 جایزه نفر {len(prizes) + 1} رو وارد کن."
+            f"باید دقیقاً {data['winner_count']} جایزه وارد کنی."
         )
-
         return
 
     await state.update_data(prizes=prizes)
+    await state.set_state(CreateGiveaway.min_users)
 
-    await state.set_state(
-        CreateGiveaway.min_users
-    )
-
-    await message.answer(
-        "👥 حداقل تعداد شرکت‌کننده‌ها چند نفر باشه؟"
-    )
+    await message.answer("حداقل تعداد شرکت‌کننده‌ها چقدر باشه؟")
 
 
 @dp.message(CreateGiveaway.min_users)
-async def get_min_users(message: Message, state: FSMContext):
+async def min_users_handler(message: Message, state: FSMContext):
 
-    try:
-        value = int(message.text)
+    value = parse_integer(message.text)
 
-        if value < 1:
-            raise ValueError
-
-    except Exception:
-        await message.answer("❌ عدد معتبر وارد کن.")
+    if value is None or value < 1:
+        await message.answer("یک عدد معتبر وارد کن.")
         return
 
     await state.update_data(min_users=value)
+    await state.set_state(CreateGiveaway.max_users)
 
-    await state.set_state(
-        CreateGiveaway.max_users
-    )
-
-    await message.answer(
-        "👥 حداکثر تعداد شرکت‌کننده‌ها چند نفر باشه؟"
-    )
+    await message.answer("حداکثر تعداد شرکت‌کننده‌ها چقدر باشه؟")
 
 
 @dp.message(CreateGiveaway.max_users)
-async def get_max_users(message: Message, state: FSMContext):
+async def max_users_handler(message: Message, state: FSMContext):
 
+    value = parse_integer(message.text)
     data = await state.get_data()
 
-    try:
-        value = int(message.text)
-
-        if value < data["min_users"]:
-            raise ValueError
-
-    except Exception:
+    if value is None or value < data["min_users"]:
         await message.answer(
-            "❌ حداکثر باید برابر یا بیشتر از حداقل باشه."
+            "حداکثر باید بزرگ‌تر یا مساوی حداقل باشه."
         )
         return
 
     await state.update_data(max_users=value)
+    await state.set_state(CreateGiveaway.duration)
 
-    await state.set_state(
-        CreateGiveaway.duration
-    )
-
-    await message.answer(
-        "⏰ قرعه‌کشی چند ساعت فعال باشه؟"
-    )
+    await message.answer("مدت قرعه‌کشی به ساعت چقدر باشه؟")
 
 
 @dp.message(CreateGiveaway.duration)
-async def get_duration(message: Message, state: FSMContext):
+async def duration_handler(message: Message, state: FSMContext):
 
-    try:
-        hours = int(message.text)
+    value = parse_integer(message.text)
 
-        if hours < 1 or hours > 8760:
-            raise ValueError
-
-    except Exception:
-        await message.answer(
-            "❌ تعداد ساعت باید بین 1 تا 8760 باشه."
-        )
+    if value is None or value < 1:
+        await message.answer("مدت باید حداقل یک ساعت باشه.")
         return
 
-    await state.update_data(duration=hours)
+    await state.update_data(duration=value)
+    await state.set_state(CreateGiveaway.mode)
 
-    await state.set_state(
-        CreateGiveaway.mode
-    )
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(
+                text="🎲 تصادفی",
+                callback_data="mode_random"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="👥 بیشترین دعوت",
+                callback_data="mode_referral"
+            )
+        ]
+    ])
 
     await message.answer(
-        "🎯 روش انتخاب برنده رو انتخاب کن:",
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(
-                        text="🎲 انتخاب تصادفی",
-                        callback_data="mode_random"
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        text="🔥 بیشترین رفرال",
-                        callback_data="mode_referral"
-                    )
-                ]
-            ]
-        )
+        "روش انتخاب برنده رو مشخص کن:",
+        reply_markup=keyboard
     )
 
 
-# =========================
-# انتخاب روش
-# =========================
-
 @dp.callback_query(F.data.startswith("mode_"))
-async def select_mode(callback: CallbackQuery, state: FSMContext):
+async def mode_handler(callback: CallbackQuery, state: FSMContext):
 
     mode = callback.data.replace("mode_", "")
+
+    if mode not in ("random", "referral"):
+        await callback.answer("روش نامعتبر است.", show_alert=True)
+        return
 
     await state.update_data(
         mode=mode,
         required_channels=[]
     )
 
-    await state.set_state(
-        CreateGiveaway.required_channels
-    )
+    await state.set_state(CreateGiveaway.required_channels)
 
     await callback.message.answer(
-        "📢 آیدی کانال جوین اجباری رو بفرست.\n\n"
-        "مثال:\n"
-        "@mychannel\n\n"
-        "برای پایان، کلمه «تمام» رو بفرست.\n"
-        "اگر کانال اجباری نداری، «ندارد» رو بفرست."
+        "آیدی یا لینک کانال‌های عضویت اجباری رو بفرست.\n"
+        "هر کانال در یک خط.\n"
+        "اگر کانال اجباری نداری، بنویس: ندارد"
     )
 
     await callback.answer()
 
 
-# =========================
-# کانال‌های اجباری
-# =========================
-
 @dp.message(CreateGiveaway.required_channels)
-async def get_required_channels(message: Message, state: FSMContext):
+async def required_channels_handler(message: Message, state: FSMContext):
 
-    channel = message.text.strip()
+    text = message.text.strip()
 
-    if channel == "ندارد" or channel == "تمام":
+    channels = []
 
-        await state.set_state(
-            CreateGiveaway.target_channel
-        )
+    if text.lower() not in ("ندارد", "ندارم", "none", "no"):
 
-        await message.answer(
-            "📣 آیدی کانال انتشار قرعه‌کشی رو بفرست."
-        )
+        items = [
+            item.strip()
+            for item in text.splitlines()
+            if item.strip()
+        ]
 
-        return
-
-    if not channel.startswith("@") and not channel.startswith("-100"):
-
-        await message.answer(
-            "❌ آیدی کانال معتبر نیست."
-        )
-
-        return
-
-    if not await check_bot_admin(channel):
-
-        await message.answer(
-            "❌ ربات در این کانال ادمین نیست!\n\n"
-            "ربات رو ادمین کن و دوباره آدرس کانال رو بفرست."
-        )
-
-        return
-
-    try:
-
-        channel_info = await get_channel_information(channel)
-
-        data = await state.get_data()
-
-        channels = data.get("required_channels", [])
-
-        if any(
-            item["chat_id"] == channel_info["chat_id"]
-            for item in channels
-        ):
-
-            await message.answer(
-                "این کانال قبلاً ثبت شده."
-            )
-
+        if len(items) > 20:
+            await message.answer("حداکثر ۲۰ کانال می‌تونی وارد کنی.")
             return
 
-        channels.append(channel_info)
+        for item in items:
+
+            try:
+                info = await get_channel_information(item)
+
+                if not await check_bot_admin(info["chat_id"]):
+                    await message.answer(
+                        f"ربات در کانال {info['title']} ادمین نیست."
+                    )
+                    return
+
+                channels.append(info)
+
+            except Exception:
+                logging.exception("Required channel error")
+                await message.answer(
+                    f"اطلاعات کانال {item} دریافت نشد. "
+                    "آیدی یا لینک را بررسی کن."
+                )
+                return
+
+    await state.update_data(required_channels=channels)
+    await state.set_state(CreateGiveaway.target_channel)
+
+    await message.answer(
+        "آیدی یا لینک کانالی که قرعه‌کشی باید در آن منتشر بشه رو بفرست."
+    )
+
+
+@dp.message(CreateGiveaway.target_channel)
+async def target_channel_handler(message: Message, state: FSMContext):
+
+    try:
+        chat = await bot.get_chat(message.text.strip())
+
+        if not await check_bot_admin(chat.id):
+            await message.answer("ربات باید در کانال مقصد ادمین باشه.")
+            return
 
         await state.update_data(
-            required_channels=channels
+            target_channel=str(chat.id),
+            target_title=chat.title
         )
 
+        await state.set_state(CreateGiveaway.post_text)
+
         await message.answer(
-            f"✅ کانال {channel_info['title']} ثبت شد.\n"
-            f"تعداد کانال‌ها: {len(channels)}\n\n"
-            "کانال بعدی رو بفرست یا «تمام» رو ارسال کن."
+            "متن پست قرعه‌کشی رو بفرست."
         )
 
     except Exception:
-
+        logging.exception("Target channel error")
         await message.answer(
-            "❌ دریافت اطلاعات کانال ناموفق بود.\n"
-            "آیدی کانال و دسترسی ادمین ربات رو بررسی کن."
+            "کانال پیدا نشد. آیدی یا لینک کانال رو بررسی کن."
         )
 
-
-# =========================
-# کانال انتشار
-# =========================
-
-@dp.message(CreateGiveaway.target_channel)
-async def get_target_channel(message: Message, state: FSMContext):
-
-    channel = message.text.strip()
-
-    if not await check_bot_admin(channel):
-
-        await message.answer(
-            "❌ ربات باید در کانال انتشار ادمین باشه."
-        )
-
-        return
-
-    await state.update_data(
-        target_channel=channel
-    )
-
-    await state.set_state(
-        CreateGiveaway.post_text
-    )
-
-    await message.answer(
-        "✍️ متن پست قرعه‌کشی رو ارسال کن."
-    )
-
-
-# =========================
-# متن پست
-# =========================
 
 @dp.message(CreateGiveaway.post_text)
-async def get_post_text(message: Message, state: FSMContext):
+async def post_text_handler(message: Message, state: FSMContext):
 
-    await state.update_data(
-        post_text=message.text
-    )
+    if not message.text:
+        await message.answer("لطفاً متن ساده ارسال کن.")
+        return
+
+    await state.update_data(post_text=message.text)
 
     data = await state.get_data()
+
+    preview = (
+        "🎁 پیش‌نمایش قرعه‌کشی\n\n"
+        f"🏆 تعداد برنده‌ها: {data['winner_count']}\n"
+        f"🎁 جوایز:\n" +
+        "\n".join(data["prizes"]) +
+        f"\n\n👥 حداقل شرکت‌کننده: {data['min_users']}"
+        f"\n👥 حداکثر شرکت‌کننده: {data['max_users']}"
+        f"\n⏰ مدت: {data['duration']} ساعت"
+        f"\n🎯 روش: {data['mode']}"
+        f"\n📢 کانال مقصد: {data['target_title']}"
+        f"\n\n📝 متن پست:\n{data['post_text']}"
+    )
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(
+                text="✅ تأیید و انتشار",
+                callback_data="confirm_create"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="❌ لغو",
+                callback_data="cancel_create"
+            )
+        ]
+    ])
+
+    await state.set_state(CreateGiveaway.post_text)
 
     await message.answer(
-        "📋 پیش‌نمایش قرعه‌کشی:\n\n"
-        f"🏆 برندگان: {data['winner_count']}\n"
-        f"🎁 جایزه‌ها: {', '.join(data['prizes'])}\n"
-        f"👥 حداقل: {data['min_users']}\n"
-        f"👥 حداکثر: {data['max_users']}\n"
-        f"⏰ مدت: {data['duration']} ساعت\n"
-        f"🎯 روش: {data['mode']}\n"
-        f"📣 کانال: {data['target_channel']}\n\n"
-        "برای انتشار تأیید کن:",
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(
-                        text="✅ ساخت قرعه‌کشی",
-                        callback_data="confirm_giveaway"
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        text="❌ لغو",
-                        callback_data="cancel_creation"
-                    )
-                ]
-            ]
-        )
+        preview,
+        reply_markup=keyboard
     )
 
 
-# =========================
-# تأیید ساخت
-# =========================
-
-@dp.callback_query(F.data == "confirm_giveaway")
+@dp.callback_query(F.data == "confirm_create")
 async def confirm_giveaway(callback: CallbackQuery, state: FSMContext):
+
+    if not is_admin(callback.from_user.id):
+        await callback.answer("اجازه نداری.", show_alert=True)
+        return
 
     data = await state.get_data()
 
+    required = [
+        "winner_count",
+        "prizes",
+        "min_users",
+        "max_users",
+        "duration",
+        "mode",
+        "target_channel",
+        "post_text",
+        "required_channels"
+    ]
+
+    if any(key not in data for key in required):
+        await callback.answer("اطلاعات ناقص است.", show_alert=True)
+        return
+
+    giveaway_id = None
+
     try:
+        await save_user(
+            callback.from_user.id,
+            callback.from_user.username,
+            callback.from_user.first_name
+        )
 
         giveaway_id = await create_giveaway(
             creator_id=callback.from_user.id,
@@ -615,114 +531,115 @@ async def confirm_giveaway(callback: CallbackQuery, state: FSMContext):
 
         text = (
             f"{data['post_text']}\n\n"
-            f"🏆 تعداد برندگان: {data['winner_count']}\n"
+            f"🏆 تعداد برنده‌ها: {data['winner_count']}\n"
             f"👥 حداقل شرکت‌کننده: {data['min_users']}\n"
+            f"👥 حداکثر شرکت‌کننده: {data['max_users']}\n"
             f"⏰ مدت: {data['duration']} ساعت"
         )
 
         await bot.send_message(
-            data["target_channel"],
+            int(data["target_channel"]),
             text,
             reply_markup=giveaway_keyboard(giveaway_id)
         )
 
         await callback.message.answer(
-            f"✅ قرعه‌کشی ساخته شد!\n"
-            f"شناسه: {giveaway_id}"
+            f"قرعه‌کشی شماره {giveaway_id} با موفقیت منتشر شد. 🎉",
+            reply_markup=main_menu()
         )
 
         await state.clear()
 
-    except Exception:
+    except Exception as error:
 
-        logging.exception("Giveaway creation error")
+        logging.exception("Giveaway creation/publication failed")
+
+        if giveaway_id is not None:
+            try:
+                await cancel_giveaway(giveaway_id)
+            except Exception:
+                logging.exception("Could not cancel failed giveaway")
 
         await callback.message.answer(
-            "❌ خطا در ساخت یا انتشار قرعه‌کشی.\n"
-            "اطلاعات کانال و دیتابیس رو بررسی کن."
+            f"خطا در ساخت یا انتشار قرعه‌کشی:\n{error}"
         )
 
     await callback.answer()
 
 
-@dp.callback_query(F.data == "cancel_creation")
-async def cancel_creation(callback: CallbackQuery, state: FSMContext):
+@dp.callback_query(F.data == "cancel_create")
+async def cancel_create(callback: CallbackQuery, state: FSMContext):
 
     await state.clear()
 
     await callback.message.answer(
-        "❌ ساخت قرعه‌کشی لغو شد.",
+        "ساخت قرعه‌کشی لغو شد.",
         reply_markup=main_menu()
     )
 
     await callback.answer()
 
 
-# =========================
-# شرکت در قرعه‌کشی
-# =========================
+# =====================================
+# JOIN GIVEAWAY
+# =====================================
+
+async def register_participant(
+    giveaway_id,
+    user_id,
+    username,
+    first_name,
+    referrer_id=None
+):
+    await save_user(user_id, username, first_name)
+
+    return await add_participant(
+        giveaway_id,
+        user_id,
+        referrer_id
+    )
+
 
 @dp.callback_query(F.data.startswith("join_"))
 async def join_giveaway(callback: CallbackQuery, state: FSMContext):
 
-    giveaway_id = int(callback.data.split("_")[1])
+    giveaway_id = parse_integer(
+        callback.data.replace("join_", "")
+    )
+
+    if giveaway_id is None:
+        await callback.answer("شناسه نامعتبر است.", show_alert=True)
+        return
 
     giveaway = await get_giveaway(giveaway_id)
 
     if not giveaway or giveaway["status"] != "active":
-
-        await callback.answer(
-            "این قرعه‌کشی فعال نیست.",
-            show_alert=True
-        )
-
+        await callback.answer("این قرعه‌کشی فعال نیست.", show_alert=True)
         return
 
     channels = await get_required_channels(giveaway_id)
 
-    buttons = []
-
     not_joined = []
 
     for channel in channels:
-
-        joined = await is_user_member(
+        if not await is_user_member(
             callback.from_user.id,
             channel["chat_id"]
-        )
-
-        if not joined:
-
+        ):
             not_joined.append(channel)
 
-            buttons.append([
-                InlineKeyboardButton(
-                    text=f"عضویت در {channel['title']}",
-                    url=channel["invite_link"]
-                )
-            ])
-
     if not_joined:
-
-        buttons.append([
-            InlineKeyboardButton(
-                text="✅ بررسی عضویت",
-                callback_data=f"verify_{giveaway_id}"
-            )
-        ])
-
         await callback.message.answer(
-            "برای شرکت باید عضو همه کانال‌های زیر بشی:",
-            reply_markup=InlineKeyboardMarkup(
-                inline_keyboard=buttons
+            "برای شرکت ابتدا در کانال‌های زیر عضو شو:",
+            reply_markup=channel_keyboard(
+                not_joined,
+                giveaway_id
             )
         )
-
         await callback.answer()
-
         return
 
-    await register_participant(
+    await verify_and_register(
         callback,
         giveaway_id,
         state
@@ -730,332 +647,313 @@ async def join_giveaway(callback: CallbackQuery, state: FSMContext):
 
 
 @dp.callback_query(F.data.startswith("verify_"))
-async def verify_membership(callback: CallbackQuery, state: FSMContext):
+async def verify_handler(callback: CallbackQuery, state: FSMContext):
 
-    giveaway_id = int(callback.data.split("_")[1])
+    giveaway_id = parse_integer(
+        callback.data.replace("verify_", "")
+    )
+
+    if giveaway_id is None:
+        await callback.answer("شناسه نامعتبر است.", show_alert=True)
+        return
+
+    giveaway = await get_giveaway(giveaway_id)
+
+    if not giveaway or giveaway["status"] != "active":
+        await callback.answer("قرعه‌کشی پایان یافته.", show_alert=True)
+        return
 
     channels = await get_required_channels(giveaway_id)
 
     for channel in channels:
-
-        joined = await is_user_member(
+        if not await is_user_member(
             callback.from_user.id,
             channel["chat_id"]
-        )
-
-        if not joined:
-
+        ):
             await callback.answer(
-                "❌ هنوز عضو همه کانال‌ها نشدی.",
+                "هنوز در همه کانال‌ها عضو نشدی.",
                 show_alert=True
             )
-
             return
 
-    await register_participant(
+    await verify_and_register(
         callback,
         giveaway_id,
         state
     )
 
 
-# =========================
-# ثبت شرکت‌کننده
-# =========================
-
-async def register_participant(callback, giveaway_id, state):
+async def verify_and_register(
+    callback: CallbackQuery,
+    giveaway_id,
+    state: FSMContext
+):
 
     data = await state.get_data()
 
-    referrer_id = data.get("pending_referrer_id")
+    referrer_id = None
 
-    if referrer_id == callback.from_user.id:
-        referrer_id = None
+    if data.get("pending_giveaway_id") == giveaway_id:
+        referrer_id = data.get("pending_referrer_id")
 
-    success = await add_participant(
-        giveaway_id=giveaway_id,
-        user_id=callback.from_user.id,
-        referrer_id=referrer_id
+    success, result = await register_participant(
+        giveaway_id,
+        callback.from_user.id,
+        callback.from_user.username,
+        callback.from_user.first_name,
+        referrer_id
     )
 
-    if not success:
+    if success:
+        await state.clear()
+
+        await callback.message.answer(
+            "تبریک! با موفقیت در قرعه‌کشی شرکت کردی. 🎉"
+        )
+
+        try:
+            me = await bot.get_me()
+
+            link = (
+                f"https://t.me/{me.username}"
+                f"?start=gw_{giveaway_id}_ref_{callback.from_user.id}"
+            )
+
+            await callback.message.answer(
+                "لینک اختصاصی دعوت دوستانت:\n"
+                f"{link}"
+            )
+
+        except Exception:
+            logging.exception("Could not create referral link")
+
+    else:
+
+        messages = {
+            "ended": "این قرعه‌کشی پایان یافته.",
+            "already_joined": "قبلاً در این قرعه‌کشی شرکت کردی.",
+            "full": "ظرفیت قرعه‌کشی تکمیل شده است."
+        }
 
         await callback.answer(
-            "قبلاً ثبت‌نام کردی یا ظرفیت قرعه‌کشی تکمیل شده.",
+            messages.get(result, "ثبت‌نام انجام نشد."),
             show_alert=True
-        )
-
-        return
-
-    me = await bot.get_me()
-
-    referral_link = (
-        f"https://t.me/{me.username}"
-        f"?start=gw_{giveaway_id}_ref_{callback.from_user.id}"
-    )
-
-    await callback.message.answer(
-        "🎉 با موفقیت در قرعه‌کشی ثبت‌نام شدی!\n\n"
-        "🔗 لینک اختصاصی دعوت دوستانت:\n"
-        f"{referral_link}\n\n"
-        "هر دعوت معتبر یک امتیاز رفرال برات ثبت می‌کنه."
-    )
-
-    await callback.answer("ثبت‌نام موفق بود!")
-
-
-# =========================
-# قرعه‌کشی‌های فعال
-# =========================
-
-@dp.callback_query(F.data == "active_giveaways")
-async def active_giveaways(callback: CallbackQuery):
-
-    giveaways = await get_active_giveaways()
-
-    if not giveaways:
-
-        await callback.message.answer(
-            "فعلاً قرعه‌کشی فعالی وجود نداره."
-        )
-
-        await callback.answer()
-
-        return
-
-    for giveaway in giveaways:
-
-        await callback.message.answer(
-            f"🎁 قرعه‌کشی شماره {giveaway['id']}\n"
-            f"🏆 تعداد برندگان: {giveaway['winner_count']}\n"
-            f"⏰ پایان: {giveaway['ends_at']}",
-            reply_markup=giveaway_keyboard(
-                giveaway["id"]
-            )
         )
 
     await callback.answer()
 
 
-# =========================
-# قرعه‌کشی‌های من
-# =========================
+# =====================================
+# ACTIVE GIVEAWAYS
+# =====================================
 
-@dp.callback_query(F.data == "my_giveaways")
-async def my_giveaways(callback: CallbackQuery):
+@dp.callback_query(F.data == "active")
+async def active_handler(callback: CallbackQuery):
+
+    giveaways = await get_active_giveaways()
+
+    if not giveaways:
+        await callback.message.answer("قرعه‌کشی فعالی وجود نداره.")
+        await callback.answer()
+        return
+
+    for giveaway in giveaways:
+
+        text = (
+            f"🎁 قرعه‌کشی شماره {giveaway['id']}\n"
+            f"🏆 تعداد برنده‌ها: {giveaway['winner_count']}\n"
+            f"👥 ظرفیت: {giveaway['max_users']}\n"
+            f"⏰ پایان: {giveaway['ends_at']}"
+        )
+
+        await callback.message.answer(
+            text,
+            reply_markup=giveaway_keyboard(giveaway["id"])
+        )
+
+    await callback.answer()
+
+
+# =====================================
+# MY GIVEAWAYS
+# =====================================
+
+@dp.callback_query(F.data == "mine")
+async def mine_handler(callback: CallbackQuery):
 
     giveaways = await get_user_giveaways(
         callback.from_user.id
     )
 
     if not giveaways:
-
         await callback.message.answer(
             "هنوز قرعه‌کشی‌ای نساختی."
         )
-
         await callback.answer()
-
         return
 
     for giveaway in giveaways:
 
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="📊 آمار",
+                    callback_data=f"stats_{giveaway['id']}"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🏆 برندگان",
+                    callback_data=f"winners_{giveaway['id']}"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="❌ لغو قرعه‌کشی",
+                    callback_data=f"cancel_{giveaway['id']}"
+                )
+            ]
+        ])
+
         await callback.message.answer(
-            f"🎁 قرعه‌کشی شماره {giveaway['id']}\n"
-            f"📌 وضعیت: {giveaway['status']}\n"
-            f"⏰ پایان: {giveaway['ends_at']}",
-            reply_markup=management_keyboard(
-                giveaway["id"]
-            )
+            f"قرعه‌کشی شماره {giveaway['id']}\n"
+            f"وضعیت: {giveaway['status']}\n"
+            f"پایان: {giveaway['ends_at']}",
+            reply_markup=keyboard
         )
 
     await callback.answer()
 
 
-# =========================
-# آمار شرکت‌کنندگان
-# =========================
+# =====================================
+# STATISTICS
+# =====================================
 
 @dp.callback_query(F.data.startswith("stats_"))
-async def giveaway_stats(callback: CallbackQuery):
+async def stats_handler(callback: CallbackQuery):
 
-    giveaway_id = int(callback.data.split("_")[1])
+    giveaway_id = parse_integer(
+        callback.data.replace("stats_", "")
+    )
 
     giveaway = await get_giveaway(giveaway_id)
 
     if not giveaway or giveaway["creator_id"] != callback.from_user.id:
-
-        await callback.answer(
-            "اجازه دسترسی نداری.",
-            show_alert=True
-        )
-
+        await callback.answer("اجازه دسترسی نداری.", show_alert=True)
         return
 
     participants = await get_participants(giveaway_id)
 
     await callback.message.answer(
         f"📊 آمار قرعه‌کشی {giveaway_id}\n\n"
-        f"👥 تعداد شرکت‌کنندگان: {len(participants)}"
+        f"👥 تعداد شرکت‌کننده‌ها: {len(participants)}\n"
+        f"🏆 تعداد برنده‌ها: {giveaway['winner_count']}\n"
+        f"وضعیت: {giveaway['status']}"
     )
 
     await callback.answer()
 
 
-# =========================
-# مشاهده برندگان
-# =========================
+# =====================================
+# WINNERS
+# =====================================
 
 @dp.callback_query(F.data.startswith("winners_"))
-async def show_winners(callback: CallbackQuery):
+async def winners_handler(callback: CallbackQuery):
 
-    giveaway_id = int(callback.data.split("_")[1])
+    giveaway_id = parse_integer(
+        callback.data.replace("winners_", "")
+    )
 
     giveaway = await get_giveaway(giveaway_id)
 
     if not giveaway or giveaway["creator_id"] != callback.from_user.id:
-
-        await callback.answer(
-            "اجازه دسترسی نداری.",
-            show_alert=True
-        )
-
+        await callback.answer("اجازه دسترسی نداری.", show_alert=True)
         return
 
     winners = await get_winners(giveaway_id)
 
     if not winners:
-
         await callback.message.answer(
             "هنوز برنده‌ای ثبت نشده."
         )
+    else:
+        text = "🏆 برندگان:\n\n"
 
-        await callback.answer()
+        for winner in winners:
+            text += (
+                f"رتبه {winner['position']}: "
+                f"`{winner['user_id']}`\n"
+            )
 
-        return
-
-    text = "🏆 برندگان قرعه‌کشی:\n\n"
-
-    for winner in winners:
-
-        text += (
-            f"رتبه {winner['position']}: "
-            f"{winner['user_id']}\n"
-            f"🎁 جایزه: {winner['prize']}\n\n"
+        await callback.message.answer(
+            text,
+            parse_mode="Markdown"
         )
-
-    await callback.message.answer(text)
 
     await callback.answer()
 
 
-# =========================
-# لغو قرعه‌کشی
-# =========================
+# =====================================
+# CANCEL GIVEAWAY
+# =====================================
 
-@dp.callback_query(F.data.startswith("cancel_gw_"))
-async def cancel_giveaway_handler(callback: CallbackQuery):
+@dp.callback_query(F.data.startswith("cancel_"))
+async def cancel_handler(callback: CallbackQuery):
 
-    giveaway_id = int(callback.data.split("_")[-1])
+    giveaway_id = parse_integer(
+        callback.data.replace("cancel_", "")
+    )
 
     giveaway = await get_giveaway(giveaway_id)
 
     if not giveaway or giveaway["creator_id"] != callback.from_user.id:
-
-        await callback.answer(
-            "اجازه لغو این قرعه‌کشی رو نداری.",
-            show_alert=True
-        )
-
+        await callback.answer("اجازه لغو نداری.", show_alert=True)
         return
 
-    await cancel_giveaway(giveaway_id)
+    result = await cancel_giveaway(giveaway_id)
 
-    await callback.message.answer(
-        "❌ قرعه‌کشی لغو شد."
-    )
+    if result:
+        await callback.message.answer(
+            f"قرعه‌کشی {giveaway_id} لغو شد."
+        )
+    else:
+        await callback.message.answer(
+            "این قرعه‌کشی فعال نیست."
+        )
 
     await callback.answer()
 
 
-# =========================
-# پایان خودکار قرعه‌کشی
-# =========================
-
-async def giveaway_worker():
-
-    while True:
-
-        try:
-
-            giveaways = await get_active_giveaways()
-
-            now = datetime.now(timezone.utc)
-
-            for giveaway in giveaways:
-
-                ends_at = giveaway["ends_at"]
-
-                if ends_at.tzinfo is None:
-                    ends_at = ends_at.replace(
-                        tzinfo=timezone.utc
-                    )
-
-                if ends_at <= now:
-
-                    await finish_giveaway_process(
-                        giveaway
-                    )
-
-        except Exception:
-
-            logging.exception(
-                "Giveaway worker error"
-            )
-
-        await asyncio.sleep(30)
-
-
-# =========================
-# انتخاب برندگان
-# =========================
+# =====================================
+# FINISH GIVEAWAY
+# =====================================
 
 async def finish_giveaway_process(giveaway):
 
     giveaway_id = giveaway["id"]
 
-    participants = await get_participants(
-        giveaway_id
-    )
+    participants = await get_participants(giveaway_id)
 
     if len(participants) < giveaway["min_users"]:
-
         await finish_giveaway(giveaway_id)
 
         await bot.send_message(
-            giveaway["target_channel"],
-            "⚠️ قرعه‌کشی به حداقل تعداد شرکت‌کننده نرسید "
-            "و برنده‌ای انتخاب نشد."
+            int(giveaway["target_channel"]),
+            f"قرعه‌کشی {giveaway_id} به حداقل تعداد شرکت‌کننده نرسید."
         )
-
-        return
-
-    if not await finish_giveaway(giveaway_id):
         return
 
     if giveaway["mode"] == "referral":
-
-        participants.sort(
-            key=lambda x: x["referral_count"],
+        ordered = sorted(
+            participants,
+            key=lambda p: p["referral_count"],
             reverse=True
         )
 
-        winners = participants[
-            :giveaway["winner_count"]
-        ]
+        winners = ordered[:giveaway["winner_count"]]
 
     else:
-
         winners = random.sample(
             participants,
             min(
@@ -1064,62 +962,93 @@ async def finish_giveaway_process(giveaway):
             )
         )
 
+    winner_data = [
+        {"user_id": winner["user_id"]}
+        for winner in winners
+    ]
+
+    # ابتدا برنده‌ها ذخیره می‌شوند تا در صورت خطا از بین نروند.
+    await save_winners(giveaway_id, winner_data)
+
+    finished = await finish_giveaway(giveaway_id)
+
+    if not finished:
+        return
+
+    winners = await get_winners(giveaway_id)
+
+    text = f"🏆 نتایج قرعه‌کشی {giveaway_id}\n\n"
+
+    for winner in winners:
+        text += (
+            f"رتبه {winner['position']}: "
+            f"`{winner['user_id']}`\n"
+        )
+
     prizes = giveaway["prizes"]
 
     if isinstance(prizes, str):
         prizes = json.loads(prizes)
 
-    winner_rows = []
+    text += "\n🎁 جوایز:\n"
 
-    for index, winner in enumerate(winners):
-
-        winner_rows.append({
-            "user_id": winner["user_id"],
-            "position": index + 1,
-            "prize": prizes[index]
-        })
-
-    await save_winners(
-        giveaway_id,
-        winner_rows
-    )
-
-    text = "🏆 قرعه‌کشی به پایان رسید!\n\n"
-
-    for winner in winner_rows:
-
-        text += (
-            f"🥇 رتبه {winner['position']}\n"
-            f"👤 شناسه کاربر: {winner['user_id']}\n"
-            f"🎁 جایزه: {winner['prize']}\n\n"
-        )
+    for prize in prizes:
+        text += f"• {prize}\n"
 
     await bot.send_message(
-        giveaway["target_channel"],
-        text
+        int(giveaway["target_channel"]),
+        text,
+        parse_mode="Markdown"
     )
 
 
-# =========================
-# اجرای ربات
-# =========================
+# =====================================
+# WORKER
+# =====================================
+
+async def giveaway_worker():
+
+    while True:
+
+        try:
+            giveaways = await get_active_giveaways()
+
+            now = datetime.now(timezone.utc)
+
+            for giveaway in giveaways:
+
+                if giveaway["ends_at"] <= now:
+                    try:
+                        await finish_giveaway_process(giveaway)
+
+                    except Exception:
+                        logging.exception(
+                            "Could not finish giveaway %s",
+                            giveaway["id"]
+                        )
+
+        except Exception:
+            logging.exception("Giveaway worker error")
+
+        await asyncio.sleep(30)
+
+
+# =====================================
+# MAIN
+# =====================================
 
 async def main():
 
     await connect_db()
-
-    logging.info("Database connected")
 
     worker = asyncio.create_task(
         giveaway_worker()
     )
 
     try:
-
         await dp.start_polling(bot)
 
     finally:
-
         worker.cancel()
 
         try:
@@ -1128,10 +1057,13 @@ async def main():
             pass
 
         await close_db()
-
         await bot.session.close()
 
 
 if __name__ == "__main__":
 
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+
+    except KeyboardInterrupt:
+        print("Bot stopped")
