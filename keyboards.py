@@ -49,5 +49,5 @@ def must_join_channels_kb(channels: list[str], lottery_id: int) -> InlineKeyboar
     return builder.as_markup()
 
 def create_ref_link(user_id: int, lottery_id: int) -> str:
-    # 🟢 لینک رفرال حالا آیدی قرعه‌کشی رو هم داره
+    # لینک رفرال شامل آیدی دعوت‌کننده و آیدی قرعه‌کشی
     return f"https://t.me/{BOT_USERNAME}?start=ref_{user_id}_{lottery_id}"
