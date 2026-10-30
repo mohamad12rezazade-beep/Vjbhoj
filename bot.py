@@ -12,6 +12,7 @@ from aiogram.types import CallbackQuery, Message
 from config import BOT_TOKEN, DATABASE_URL, ADMIN_IDS
 from database import Database, PostgresStorage
 from keyboards import main_menu_kb, back_to_menu_kb
+from states import CreateLottery
 
 # ------------------- لاگ -------------------
 logging.basicConfig(
@@ -24,6 +25,68 @@ logger = logging.getLogger("lottery-bot")
 # ------------------- آبجکت‌های سراسری -------------------
 db = Database(DATABASE_URL)
 router = Router()
+
+
+# ------------------- توابع کمکی -------------------
+async def init_db() -> None:
+    """ساخت خودکار تمام جدول‌های ضروری در صورت نبودن"""
+    async with db.pool.acquire() as conn:
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id BIGINT PRIMARY KEY,
+                username TEXT,
+                first_name TEXT,
+                last_name TEXT,
+                is_admin BOOLEAN NOT NULL DEFAULT FALSE,
+                points INTEGER NOT NULL DEFAULT 0,
+                referred_by BIGINT REFERENCES users(user_id) ON DELETE SET NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+
+            CREATE TABLE IF NOT EXISTS lotteries (
+                id BIGSERIAL PRIMARY KEY,
+                owner_id BIGINT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+                winners_count INTEGER NOT NULL CHECK (winners_count > 0),
+                prizes TEXT NOT NULL,
+                min_participants INTEGER NOT NULL DEFAULT 1,
+                max_participants INTEGER NOT NULL,
+                mode TEXT NOT NULL,
+                required_channels TEXT NOT NULL DEFAULT '',
+                publish_channel TEXT NOT NULL,
+                post_text TEXT NOT NULL,
+                post_message_id BIGINT,
+                status TEXT NOT NULL DEFAULT 'active',
+                ends_at TIMESTAMPTZ NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                finished_at TIMESTAMPTZ
+            );
+
+            CREATE TABLE IF NOT EXISTS participants (
+                id BIGSERIAL PRIMARY KEY,
+                lottery_id BIGINT NOT NULL REFERENCES lotteries(id) ON DELETE CASCADE,
+                user_id BIGINT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+                joined_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                UNIQUE(lottery_id, user_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS winners (
+                id BIGSERIAL PRIMARY KEY,
+                lottery_id BIGINT NOT NULL REFERENCES lotteries(id) ON DELETE CASCADE,
+                user_id BIGINT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+                prize TEXT,
+                position INTEGER NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                UNIQUE(lottery_id, user_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS fsm_states (
+                user_id BIGINT PRIMARY KEY,
+                state TEXT,
+                data JSONB NOT NULL DEFAULT '{}'::jsonb,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+        """)
+        logger.info("همه جدول‌ها آماده هستند.")
 
 
 # ------------------- هندلرها -------------------
@@ -158,15 +221,17 @@ async def cb_fallback(callback: CallbackQuery) -> None:
 
 @router.message()
 async def msg_fallback(message: Message) -> None:
-    await message.answer(
-        "متوجه نشدم. از /menu استفاده کن.",
-    )
+    await message.answer("متوجه نشدم. از /menu استفاده کن.")
 
 
 # ------------------- راه‌اندازی -------------------
 async def main() -> None:
     logger.info("در حال اتصال به دیتابیس...")
     await db.connect()
+    
+    logger.info("در حال ساخت جدول‌ها...")
+    await init_db()
+
     logger.info("اتصال برقرار شد. شروع پولینگ...")
 
     bot = Bot(
