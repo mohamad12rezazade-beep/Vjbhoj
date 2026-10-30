@@ -1,10 +1,10 @@
 name: Run Telegram Bot
 
+# فقط دستی اجرا میشه، با هر تغییر یا آپلود فایل روشن نمیشه!
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
 
+# جلوگیری از اجرای همزمان چند نسخه از ربات
 concurrency:
   group: telegram-bot
   cancel-in-progress: true
