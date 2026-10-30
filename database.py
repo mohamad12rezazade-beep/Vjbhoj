@@ -1,291 +1,294 @@
 import json
+import logging
+from datetime import datetime, timezone
+from typing import Any, Iterable, Optional
+
 import asyncpg
-from config import DATABASE_URL
 
-_pool = None
+logger = logging.getLogger(__name__)
 
 
-async def connect_db():
-    global _pool
+class Database:
+    def __init__(self, dsn: str) -> None:
+        self.dsn = dsn
+        self.pool: Optional[asyncpg.Pool] = None
 
-    if _pool is None:
-        _pool = await asyncpg.create_pool(
-            DATABASE_URL,
+    async def connect(self) -> None:
+        self.pool = await asyncpg.create_pool(
+            dsn=self.dsn,
             min_size=1,
-            max_size=10,
-            ssl="require",
-            command_timeout=30
+            max_size=5,
+            command_timeout=60,
+            statement_cache_size=0,  # مهم برای PgBouncer (Supabase Pooler)
         )
+        logger.info("اتصال به دیتابیس برقرار شد.")
 
-    return _pool
+    async def close(self) -> None:
+        if self.pool:
+            await self.pool.close()
+            logger.info("اتصال دیتابیس بسته شد.")
 
-
-async def close_db():
-    global _pool
-
-    if _pool is not None:
-        await _pool.close()
-        _pool = None
-
-
-def get_pool():
-    if _pool is None:
-        raise RuntimeError("Database is not connected")
-
-    return _pool
-
-
-async def save_user(user_id, username=None, first_name=None):
-    await get_pool().execute("""
-        INSERT INTO users (user_id, username, first_name)
-        VALUES ($1, $2, $3)
-        ON CONFLICT (user_id)
-        DO UPDATE SET
-            username = EXCLUDED.username,
-            first_name = EXCLUDED.first_name
-    """, user_id, username, first_name)
-
-
-async def create_giveaway(
-    creator_id,
-    winner_count,
-    prizes,
-    min_users,
-    max_users,
-    duration,
-    mode,
-    target_channel,
-    post_text,
-    required_channels
-):
-    async with get_pool().acquire() as conn:
-        async with conn.transaction():
-
-            await conn.execute("""
-                INSERT INTO users (user_id)
-                VALUES ($1)
-                ON CONFLICT (user_id) DO NOTHING
-            """, creator_id)
-
-            giveaway_id = await conn.fetchval("""
-                INSERT INTO giveaways (
-                    creator_id,
-                    winner_count,
-                    prizes,
-                    min_users,
-                    max_users,
-                    duration,
-                    mode,
-                    target_channel,
-                    post_text,
-                    status,
-                    ends_at
-                )
-                VALUES (
-                    $1, $2, $3::jsonb, $4, $5, $6, $7, $8, $9,
-                    'active',
-                    NOW() + ($6 * INTERVAL '1 hour')
-                )
-                RETURNING id
-            """,
-                creator_id,
-                winner_count,
-                json.dumps(prizes, ensure_ascii=False),
-                min_users,
-                max_users,
-                duration,
-                mode,
-                str(target_channel),
-                post_text
+    # ---------------- کاربران ----------------
+    async def upsert_user(
+        self, user_id: int, username: Optional[str], first_name: Optional[str],
+        last_name: Optional[str],
+    ) -> None:
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO users (user_id, username, first_name, last_name)
+                VALUES ($1, $2, $3, $4)
+                ON CONFLICT (user_id) DO UPDATE
+                SET username = EXCLUDED.username,
+                    first_name = EXCLUDED.first_name,
+                    last_name = EXCLUDED.last_name
+                """,
+                user_id, username, first_name, last_name,
             )
 
-            for channel in required_channels:
-                await conn.execute("""
-                    INSERT INTO required_channels (
-                        giveaway_id,
-                        chat_id,
-                        title,
-                        invite_link
-                    )
-                    VALUES ($1, $2, $3, $4)
-                    ON CONFLICT (giveaway_id, chat_id)
-                    DO UPDATE SET
-                        title = EXCLUDED.title,
-                        invite_link = EXCLUDED.invite_link
-                """,
-                    giveaway_id,
-                    str(channel["chat_id"]),
-                    channel.get("title"),
-                    channel.get("invite_link")
-                )
+    async def get_user(self, user_id: int) -> Optional[asyncpg.Record]:
+        async with self.pool.acquire() as conn:
+            return await conn.fetchrow("SELECT * FROM users WHERE user_id = $1", user_id)
 
-            return giveaway_id
+    async def is_admin(self, user_id: int) -> bool:
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT is_admin FROM users WHERE user_id = $1", user_id
+            )
+        return bool(row and row["is_admin"])
 
+    async def set_admin(self, user_id: int, is_admin: bool) -> None:
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE users SET is_admin = $1 WHERE user_id = $2",
+                is_admin, user_id,
+            )
 
-async def get_giveaway(giveaway_id):
-    return await get_pool().fetchrow("""
-        SELECT * FROM giveaways WHERE id = $1
-    """, giveaway_id)
-
-
-async def get_active_giveaways():
-    return await get_pool().fetch("""
-        SELECT * FROM giveaways
-        WHERE status = 'active'
-        ORDER BY ends_at ASC
-    """)
-
-
-async def get_user_giveaways(user_id):
-    return await get_pool().fetch("""
-        SELECT * FROM giveaways
-        WHERE creator_id = $1
-        ORDER BY created_at DESC
-    """, user_id)
-
-
-async def get_required_channels(giveaway_id):
-    return await get_pool().fetch("""
-        SELECT * FROM required_channels
-        WHERE giveaway_id = $1
-    """, giveaway_id)
-
-
-async def add_participant(giveaway_id, user_id, referrer_id=None):
-    async with get_pool().acquire() as conn:
-        async with conn.transaction():
-
-            giveaway = await conn.fetchrow("""
-                SELECT * FROM giveaways
-                WHERE id = $1
-                FOR UPDATE
-            """, giveaway_id)
-
-            if not giveaway or giveaway["status"] != "active":
-                return False, "ended"
-
-            if giveaway["ends_at"] <= await conn.fetchval("SELECT NOW()"):
-                return False, "ended"
-
-            existing = await conn.fetchval("""
-                SELECT 1 FROM participants
-                WHERE giveaway_id = $1 AND user_id = $2
-            """, giveaway_id, user_id)
-
-            if existing:
-                return False, "already_joined"
-
-            count = await conn.fetchval("""
-                SELECT COUNT(*) FROM participants
-                WHERE giveaway_id = $1 AND active = TRUE
-            """, giveaway_id)
-
-            if count >= giveaway["max_users"]:
-                return False, "full"
-
-            await conn.execute("""
-                INSERT INTO users (user_id)
-                VALUES ($1)
-                ON CONFLICT (user_id) DO NOTHING
-            """, user_id)
-
-            valid_referrer = None
-
-            if referrer_id and referrer_id != user_id:
-                is_valid = await conn.fetchval("""
-                    SELECT 1 FROM participants
-                    WHERE giveaway_id = $1
-                      AND user_id = $2
-                      AND active = TRUE
-                """, giveaway_id, referrer_id)
-
-                if is_valid:
-                    valid_referrer = referrer_id
-
-            await conn.execute("""
-                INSERT INTO participants (
-                    giveaway_id,
+    async def set_referrer_if_empty(self, user_id: int, referrer_id: int) -> bool:
+        """اگر کاربر قبلاً معرف نداشته، ثبت می‌شود. برای جلوگیری از تقلب."""
+        if user_id == referrer_id:
+            return False
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    "SELECT referred_by FROM users WHERE user_id = $1 FOR UPDATE",
                     user_id,
-                    active,
-                    referral_count,
-                    referred_by
                 )
-                VALUES ($1, $2, TRUE, 0, $3)
-            """, giveaway_id, user_id, valid_referrer)
+                if row is None or row["referred_by"] is not None:
+                    return False
+                await conn.execute(
+                    "UPDATE users SET referred_by = $1 WHERE user_id = $2",
+                    referrer_id, user_id,
+                )
+                await conn.execute(
+                    "UPDATE users SET points = points + 1 WHERE user_id = $1",
+                    referrer_id,
+                )
+                return True
 
-            if valid_referrer:
-                inserted = await conn.fetchval("""
-                    INSERT INTO referrals (
-                        giveaway_id,
-                        referrer_id,
-                        referred_user_id
+    # ---------------- قرعه‌کشی ----------------
+    async def create_lottery(self, data: dict[str, Any]) -> int:
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    """
+                    INSERT INTO lotteries
+                        (owner_id, winners_count, prizes, min_participants,
+                         max_participants, mode, required_channels,
+                         publish_channel, post_text, ends_at)
+                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+                    RETURNING id
+                    """,
+                    data["owner_id"], data["winners_count"], data["prizes"],
+                    data["min_participants"], data["max_participants"],
+                    data["mode"], data["required_channels"],
+                    data["publish_channel"], data["post_text"], data["ends_at"],
+                )
+                return row["id"]
+
+    async def set_post_message(self, lottery_id: int, message_id: int) -> None:
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE lotteries SET post_message_id = $1 WHERE id = $2",
+                message_id, lottery_id,
+            )
+
+    async def get_lottery(self, lottery_id: int) -> Optional[asyncpg.Record]:
+        async with self.pool.acquire() as conn:
+            return await conn.fetchrow("SELECT * FROM lotteries WHERE id = $1", lottery_id)
+
+    async def get_active_lotteries(self, limit: int = 20) -> list[asyncpg.Record]:
+        async with self.pool.acquire() as conn:
+            return await conn.fetch(
+                "SELECT * FROM lotteries WHERE status='active' "
+                "ORDER BY ends_at ASC LIMIT $1", limit,
+            )
+
+    async def get_user_lotteries(self, owner_id: int, limit: int = 20) -> list[asyncpg.Record]:
+        async with self.pool.acquire() as conn:
+            return await conn.fetch(
+                "SELECT * FROM lotteries WHERE owner_id=$1 ORDER BY created_at DESC LIMIT $2",
+                owner_id, limit,
+            )
+
+    async def cancel_lottery(self, lottery_id: int) -> None:
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE lotteries SET status='cancelled', finished_at=NOW() "
+                "WHERE id=$1 AND status='active'", lottery_id,
+            )
+
+    async def get_expired_active_lotteries(self) -> list[asyncpg.Record]:
+        async with self.pool.acquire() as conn:
+            return await conn.fetch(
+                "SELECT * FROM lotteries WHERE status='active' AND ends_at <= NOW()"
+            )
+
+    # ---------------- شرکت‌کنندگان ----------------
+    async def is_participant(self, lottery_id: int, user_id: int) -> bool:
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT 1 FROM participants WHERE lottery_id=$1 AND user_id=$2",
+                lottery_id, user_id,
+            )
+        return row is not None
+
+    async def count_participants(self, lottery_id: int) -> int:
+        async with self.pool.acquire() as conn:
+            return await conn.fetchval(
+                "SELECT COUNT(*) FROM participants WHERE lottery_id=$1", lottery_id,
+            )
+
+    async def join_lottery(self, lottery_id: int, user_id: int) -> Optional[str]:
+        """
+        برمی‌گرداند: 'ok' | 'already' | 'full' | 'not_active'
+        """
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                lot = await conn.fetchrow(
+                    "SELECT * FROM lotteries WHERE id=$1 FOR UPDATE", lottery_id,
+                )
+                if lot is None or lot["status"] != "active":
+                    return "not_active"
+                if lot["ends_at"] <= datetime.now(timezone.utc):
+                    return "not_active"
+                exists = await conn.fetchrow(
+                    "SELECT 1 FROM participants WHERE lottery_id=$1 AND user_id=$2",
+                    lottery_id, user_id,
+                )
+                if exists:
+                    return "already"
+                cnt = await conn.fetchval(
+                    "SELECT COUNT(*) FROM participants WHERE lottery_id=$1", lottery_id,
+                )
+                if cnt >= lot["max_participants"]:
+                    return "full"
+                await conn.execute(
+                    "INSERT INTO participants (lottery_id, user_id) VALUES ($1,$2)",
+                    lottery_id, user_id,
+                )
+                return "ok"
+
+    async def get_participants(self, lottery_id: int) -> list[asyncpg.Record]:
+        async with self.pool.acquire() as conn:
+            return await conn.fetch(
+                "SELECT p.user_id, u.points FROM participants p "
+                "JOIN users u ON u.user_id=p.user_id WHERE p.lottery_id=$1",
+                lottery_id,
+            )
+
+    async def get_winner_ids(self, lottery_id: int) -> set[int]:
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT user_id FROM winners WHERE lottery_id=$1", lottery_id,
+            )
+        return {r["user_id"] for r in rows}
+
+    async def save_winners(
+        self, lottery_id: int, winners: Iterable[tuple[int, str]],
+    ) -> None:
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                pos = 0
+                for user_id, prize in winners:
+                    pos += 1
+                    await conn.execute(
+                        "INSERT INTO winners (lottery_id, user_id, prize, position) "
+                        "VALUES ($1,$2,$3,$4) ON CONFLICT DO NOTHING",
+                        lottery_id, user_id, prize, pos,
                     )
-                    VALUES ($1, $2, $3)
-                    ON CONFLICT DO NOTHING
-                    RETURNING referred_user_id
-                """, giveaway_id, valid_referrer, user_id)
+                await conn.execute(
+                    "UPDATE lotteries SET status='finished', finished_at=NOW() "
+                    "WHERE id=$1 AND status='active'", lottery_id,
+                )
 
-                if inserted:
-                    await conn.execute("""
-                        UPDATE participants
-                        SET referral_count = referral_count + 1
-                        WHERE giveaway_id = $1 AND user_id = $2
-                    """, giveaway_id, valid_referrer)
-
-            return True, "joined"
-
-
-async def get_participants(giveaway_id):
-    return await get_pool().fetch("""
-        SELECT * FROM participants
-        WHERE giveaway_id = $1 AND active = TRUE
-    """, giveaway_id)
+    # ---------------- آمار ----------------
+    async def stats(self) -> dict[str, int]:
+        async with self.pool.acquire() as conn:
+            users = await conn.fetchval("SELECT COUNT(*) FROM users")
+            lotteries = await conn.fetchval("SELECT COUNT(*) FROM lotteries")
+            participants = await conn.fetchval("SELECT COUNT(*) FROM participants")
+            active = await conn.fetchval(
+                "SELECT COUNT(*) FROM lotteries WHERE status='active'"
+            )
+        return {
+            "users": users, "lotteries": lotteries,
+            "participants": participants, "active": active,
+        }
 
 
-async def save_winners(giveaway_id, winners):
-    async with get_pool().acquire() as conn:
-        async with conn.transaction():
-            await conn.execute("""
-                DELETE FROM winners WHERE giveaway_id = $1
-            """, giveaway_id)
-
-            for position, winner in enumerate(winners, start=1):
-                await conn.execute("""
-                    INSERT INTO winners (
-                        giveaway_id,
-                        user_id,
-                        position
-                    )
-                    VALUES ($1, $2, $3)
-                    ON CONFLICT DO NOTHING
-                """, giveaway_id, winner["user_id"], position)
+# ---------------- FSM Storage در دیتابیس ----------------
+from aiogram.fsm.state import State
+from aiogram.fsm.storage.base import BaseStorage, StorageKey
 
 
-async def get_winners(giveaway_id):
-    return await get_pool().fetch("""
-        SELECT w.*, p.referral_count
-        FROM winners w
-        LEFT JOIN participants p
-          ON p.giveaway_id = w.giveaway_id
-         AND p.user_id = w.user_id
-        WHERE w.giveaway_id = $1
-        ORDER BY w.position
-    """, giveaway_id)
+class PostgresStorage(BaseStorage):
+    """
+    Storage سازگار با aiogram 3 که State و Data را در PostgreSQL نگه می‌دارد.
+    برای اجرا روی GitHub Actions (محیط ephemeral) لازم است.
+    """
 
+    def __init__(self, db: Database) -> None:
+        self.db = db
 
-async def finish_giveaway(giveaway_id):
-    return await get_pool().fetchrow("""
-        UPDATE giveaways
-        SET status = 'ended'
-        WHERE id = $1 AND status = 'active'
-        RETURNING *
-    """, giveaway_id)
+    async def set_state(self, key: StorageKey, state) -> None:
+        state_value = state.state if isinstance(state, State) else state
+        async with self.db.pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO fsm_states (user_id, state, updated_at)
+                VALUES ($1, $2, NOW())
+                ON CONFLICT (user_id) DO UPDATE
+                SET state = EXCLUDED.state, updated_at = NOW()
+                """,
+                key.user_id, state_value,
+            )
 
+    async def get_state(self, key: StorageKey):
+        async with self.db.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT state FROM fsm_states WHERE user_id=$1", key.user_id,
+            )
+        return row["state"] if row else None
 
-async def cancel_giveaway(giveaway_id):
-    return await get_pool().fetchrow("""
-        UPDATE giveaways
-        SET status = 'cancelled'
-        WHERE id = $1 AND status = 'active'
-        RETURNING *
-    """, giveaway_id)
+    async def set_data(self, key: StorageKey, data: dict) -> None:
+        async with self.db.pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO fsm_states (user_id, data, updated_at)
+                VALUES ($1, $2::jsonb, NOW())
+                ON CONFLICT (user_id) DO UPDATE
+                SET data = EXCLUDED.data, updated_at = NOW()
+                """,
+                key.user_id, json.dumps(data, ensure_ascii=False),
+            )
+
+    async def get_data(self, key: StorageKey) -> dict:
+        async with self.db.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT data FROM fsm_states WHERE user_id=$1", key.user_id,
+            )
+        return dict(row["data"]) if row and row["data"] else {}
+
+    async def close(self) -> None:
+        return None
