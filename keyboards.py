@@ -1,125 +1,23 @@
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-
-
-# منوی اصلی
-def main_menu():
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="🎁 ساخت قرعه‌کشی",
-                    callback_data="create_giveaway"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🌐 قرعه‌کشی‌های فعال ربات",
-                    callback_data="active_giveaways"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🏆 قرعه‌کشی‌های من",
-                    callback_data="my_giveaways"
-                )
-            ]
-        ]
-    )
-
-
-# دکمه شرکت در قرعه‌کشی
-def giveaway_keyboard(giveaway_id):
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="🎉 شرکت در قرعه‌کشی",
-                    callback_data=f"join_{giveaway_id}"
-                )
-            ]
-        ]
-    )
-
-
-# دکمه‌های مدیریت قرعه‌کشی
-def manage_giveaway_keyboard(giveaway_id):
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="📊 آمار شرکت‌کنندگان",
-                    callback_data=f"stats_{giveaway_id}"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="⏸ توقف قرعه‌کشی",
-                    callback_data=f"stop_{giveaway_id}"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="❌ لغو قرعه‌کشی",
-                    callback_data=f"cancel_{giveaway_id}"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🏆 مشاهده برندگان",
-                    callback_data=f"winners_{giveaway_id}"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🔙 بازگشت",
-                    callback_data="back_home"
-                )
-            ]
-        ]
-    )
-
-
-# دکمه تأیید و انصراف
-def confirm_keyboard(yes_callback, no_callback):
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="✅ تأیید",
-                    callback_data=yes_callback
-                ),
-                InlineKeyboardButton(
-                    text="❌ انصراف",
-                    callback_data=no_callback
-                )
-            ]
-        ]
-    )
-
-
-# دکمه بازگشت
-def back_keyboard():
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="🔙 بازگشت به منوی اصلی",
-                    callback_data="back_home"
-                )
-            ]
-        ]
-    )
-
-
-# دکمه بررسی عضویت
-def verify_keyboard(giveaway_id):
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="✅ بررسی عضویت",
-                    callback_data=f"verify_{giveaway_id}"
-                )
-            ]
-        ]
+from aiogram.types import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
 )
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+
+
+def main_menu_kb() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(text="🎁 ساخت قرعه‌کشی", callback_data="create_lottery"))
+    builder.row(InlineKeyboardButton(text="📋 قرعه‌کشی‌های فعال", callback_data="active_lotteries"))
+    builder.row(InlineKeyboardButton(text="👤 قرعه‌کشی‌های من", callback_data="my_lotteries"))
+    builder.row(InlineKeyboardButton(text="📊 آمار ربات", callback_data="stats"))
+    builder.row(InlineKeyboardButton(text="📖 راهنما", callback_data="help"))
+    return builder.as_markup()
+
+
+def back_to_menu_kb() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(text="⬅️ بازگشت به منو", callback_data="main_menu"))
+    return builder.as_markup()
