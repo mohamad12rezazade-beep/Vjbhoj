@@ -87,9 +87,12 @@ async def init_db() -> None:
                 user_id BIGINT PRIMARY KEY,
                 state TEXT,
                 data JSONB NOT NULL DEFAULT '{}'::jsonb,
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                temp_flag TEXT
             );
         """)
+        # این خط خودش ستون رو به جدول اضافه میکنه اگه نبود
+        await conn.execute("ALTER TABLE fsm_states ADD COLUMN IF NOT EXISTS temp_flag TEXT;")
         logger.info("✅ جدول‌ها آماده هستند.")
 
 async def is_member(bot: Bot, user_id: int) -> bool:
@@ -156,6 +159,8 @@ async def lottery_checker(bot: Bot) -> None:
             logger.exception(f"خطا در اسکنر: {e}")
         await asyncio.sleep(60)
 
+
+# 🟢 ---- دستور استارت ----
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext, bot: Bot) -> None:
     await state.clear()
@@ -268,6 +273,7 @@ async def cb_create_lottery(callback: CallbackQuery, state: FSMContext, bot: Bot
     )
     await callback.answer()
 
+# 🟢 ---- هندلرهای FSM ----
 @router.message(CreateLottery.winners_count)
 async def step_winners(message: Message, state: FSMContext) -> None:
     try:
@@ -276,6 +282,29 @@ async def step_winners(message: Message, state: FSMContext) -> None:
     except:
         await message.answer("❌ یک عدد مثبت بفرست.")
         return
+    await state.update_data(winners_count=n)
+    await state.set_state(CreateLottery.prizes)
+    await message.answer(
+        f"✅ تعداد برندگان: <b>{n}</b>\n\n"
+        "🎁 <b>مرحله ۲ از ۱۰</b>\n\n"
+        "جوایز رو بنویس (هر جایزه در یک خط):",
+        reply_markup=cancel_kb()
+    )
+
+# 🟢 ---- هندلر نجات‌دهنده (Fallback for numbers) ----
+@router.message(F.text.regexp(r"^\d+$"))
+async def fallback_number_handler(message: Message, state: FSMContext) -> None:
+    current_state = await state.get_state()
+    if current_state is not None:
+        return 
+    
+    try:
+        n = int(message.text.strip())
+        if n <= 0: raise ValueError
+    except:
+        await message.answer("❌ یک عدد مثبت بفرست.")
+        return
+        
     await state.update_data(winners_count=n)
     await state.set_state(CreateLottery.prizes)
     await message.answer(
@@ -537,29 +566,6 @@ async def cb_my_lotteries(callback: CallbackQuery) -> None:
         text = "\n".join(lines)
     await callback.message.edit_text(text, reply_markup=back_to_menu_kb())
     await callback.answer()
-
-# 🟢 این هندلر طلاییه! اگه استیت لود نشد، وقتی کاربر فقط یه عدد فرستاد، خودش می‌فهمه که تو مرحله ۱ هستیم
-@router.message(F.text.regexp(r"^\d+$"))
-async def fallback_number_handler(message: Message, state: FSMContext) -> None:
-    current_state = await state.get_state()
-    if current_state is not None:
-        return # اگه استیت درست لود شده بود، اینجا کاری نکنه بذاره هندلر اصلی کارش رو بکنه
-    
-    # اگه استیت نال بود (باگ تاخیر دیتابیس) و کاربر عدد فرستاد، خودمون میریم مرحله ۲
-    try:
-        n = int(message.text.strip())
-        if n <= 0: raise ValueError
-    except:
-        await message.answer("❌ یک عدد مثبت بفرست.")
-        return
-    await state.update_data(winners_count=n)
-    await state.set_state(CreateLottery.prizes)
-    await message.answer(
-        f"✅ تعداد برندگان: <b>{n}</b>\n\n"
-        "🎁 <b>مرحله ۲ از ۱۰</b>\n\n"
-        "جوایز رو بنویس (هر جایزه در یک خط):",
-        reply_markup=cancel_kb()
-    )
 
 @router.callback_query()
 async def cb_fallback(callback: CallbackQuery) -> None:
