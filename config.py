@@ -1,5 +1,4 @@
 import os
-from dataclasses import dataclass
 
 from dotenv import load_dotenv
 
@@ -13,20 +12,8 @@ def _require(name: str) -> str:
     return value
 
 
-@dataclass(frozen=True)
-class Config:
-    bot_token: str
-    database_url: str
-    # آیدی عددی ادمین اصلی (اولین ادمین)
-    super_admin_id: int
+BOT_TOKEN: str = _require("BOT_TOKEN")
+DATABASE_URL: str = _require("DATABASE_URL")
 
-
-def load_config() -> Config:
-    return Config(
-        bot_token=_require("BOT_TOKEN"),
-        database_url=_require("DATABASE_URL"),
-        super_admin_id=int(os.getenv("SUPER_ADMIN_ID", "0")),
-    )
-
-
-config = load_config()
+_admin_raw = os.getenv("ADMIN_IDS", "")
+ADMIN_IDS: list[int] = [int(x.strip()) for x in _admin_raw.split(",") if x.strip().isdigit()]
