@@ -1,6 +1,8 @@
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
+BOT_USERNAME = "BOT_TEKvcxBOT"
+
 def main_menu_kb() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.row(InlineKeyboardButton(text="🎁 ساخت قرعه‌کشی", callback_data="create_lottery"))
@@ -26,12 +28,22 @@ def confirm_lottery_kb() -> InlineKeyboardMarkup:
     builder.row(InlineKeyboardButton(text="❌ لغو", callback_data="main_menu"))
     return builder.as_markup()
 
-def lottery_join_kb(lottery_id: int, bot_username: str) -> InlineKeyboardMarkup:
+def lottery_join_kb(lottery_id: int) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    builder.row(InlineKeyboardButton(text="🎉 شرکت در قرعه‌کشی", url=f"https://t.me/{bot_username}?start=join_{lottery_id}"))
+    builder.row(InlineKeyboardButton(text="🎉 شرکت در قرعه‌کشی", url=f"https://t.me/{BOT_USERNAME}?start=join_{lottery_id}"))
     return builder.as_markup()
 
-def join_lottery_inline_kb(lottery_id: int) -> InlineKeyboardMarkup:
+def join_confirm_kb(lottery_id: int) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    builder.row(InlineKeyboardButton(text="🎉 شرکت در قرعه‌کشی", callback_data=f"join_{lottery_id}"))
+    builder.row(
+        InlineKeyboardButton(text="✅ بله، شرکت می‌کنم", callback_data=f"do_join_{lottery_id}"),
+        InlineKeyboardButton(text="❌ خیر", callback_data="main_menu")
+    )
+    return builder.as_markup()
+
+def must_join_channels_kb(channels: list[str]) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    for ch in channels:
+        builder.row(InlineKeyboardButton(text=f"📢 عضویت در {ch}", url=f"https://t.me/{ch.replace('@', '')}"))
+    builder.row(InlineKeyboardButton(text="✅ عضو شدم", callback_data="check_join_membership"))
     return builder.as_markup()
