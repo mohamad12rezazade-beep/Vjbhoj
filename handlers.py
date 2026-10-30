@@ -1,5 +1,4 @@
 import logging
-import random
 from datetime import datetime, timezone, timedelta
 
 from aiogram import Bot, F, Router
@@ -13,13 +12,11 @@ from config import ADMIN_IDS
 from database import Database
 from keyboards import (
     main_menu_kb, back_to_menu_kb, cancel_kb, confirm_lottery_kb,
-    lottery_join_kb, join_confirm_kb, must_join_channels_kb
+    lottery_join_kb, join_confirm_kb, must_join_channels_kb, create_ref_link
 )
 from states import CreateLottery
 
 logger = logging.getLogger("lottery-bot")
-router = Router()
-
 REQUIRED_CHANNEL = "@BET_1XZX"
 
 def join_channel_kb():
@@ -32,83 +29,14 @@ async def is_member(bot: Bot, user_id: int, channel: str) -> bool:
     try:
         member = await bot.get_chat_member(chat_id=channel, user_id=user_id)
         return member.status not in ("left", "kicked")
-    except Exception as e:
-        logger.warning(f"خطا در بررسی عضویت {channel}: {e}")
+    except Exception:
         return False
 
 def setup_handlers(db: Database) -> Router:
     router = Router()
 
-    # 🟢 ---- استارت ----
-    @router.message(CommandStart())
-    async def cmd_start(message: Message, state: FSMContext, bot: Bot):
-        await state.clear()
-        user = message.from_user
-        if user is None: return
-
-        args = message.text.split()
-        payload = args[1] if len(args) > 1 else None
-
-        if not await is_member(bot, user.id, REQUIRED_CHANNEL):
-            await message.answer(
-                f"⚠️ برای استفاده از ربات، ابتدا باید در کانال زیر عضو بشی:\n\n➡️ {REQUIRED_CHANNEL}\n\nبعد از عضویت، روی دکمه «✅ عضو شدم» بزن.",
-                reply_markup=join_channel_kb()
-            )
-            return
-
-        try:
-            await db.upsert_user(user.id, user.username, user.first_name, user.last_name)
-            if user.id in ADMIN_IDS:
-                await db.set_admin(user.id, True)
-        except Exception as e:
-            logger.exception("خطا در ثبت کاربر: %s", e)
-            return
-
-        if payload and payload.startswith("ref_"):
-            try:
-                referrer_id = int(payload.replace("ref_", ""))
-                success = await db.set_referrer_if_empty(user.id, referrer_id)
-                if success:
-                    try:
-                        await bot.send_message(referrer_id, "🎉 یکی از دوستانت با لینک تو وارد ربات شد و <b>۱ امتیاز</b> گرفتی!")
-                    except Exception:
-                        pass
-            except Exception as e:
-                logger.exception(f"خطا در ثبت رفرال: {e}")
-
-        if payload and payload.startswith("join_"):
-            try:
-                lot_id = int(payload.replace("join_", ""))
-                await show_lottery_preview(message, lot_id, db)
-                return
-            except Exception as e:
-                logger.exception(f"خطا در join_ payload: {e}")
-
-        await message.answer(
-            f"👋 سلام <b>{user.first_name}</b>!\n\nبه ربات <b>قرعه‌کشی</b> خوش آمدی.\nاز منوی زیر یک گزینه را انتخاب کن:",
-            reply_markup=main_menu_kb(),
-        )
-
-    @router.callback_query(F.data == "check_member")
-    async def cb_check_member(callback: CallbackQuery, bot: Bot):
-        if await is_member(bot, callback.from_user.id, REQUIRED_CHANNEL):
-            user = callback.from_user
-            try:
-                await db.upsert_user(user.id, user.username, user.first_name, user.last_name)
-                if user.id in ADMIN_IDS:
-                    await db.set_admin(user.id, True)
-            except Exception:
-                pass
-            await callback.message.edit_text(
-                f"✅ عضویتت تأیید شد، خوش اومدی <b>{user.first_name}</b>!\n\nاز منوی زیر انتخاب کن:",
-                reply_markup=main_menu_kb()
-            )
-        else:
-            await callback.answer("❌ هنوز عضو نشدی! اول عضو شو.", show_alert=True)
-
-    # 🟢 ---- پیش‌نمایش ----
-    async def show_lottery_preview(message: Message, lottery_id: int, db_ref: Database):
-        lot = await db_ref.get_lottery(lottery_id)
+    async def show_lottery_preview(message: Message, lottery_id: int):
+        lot = await db.get_lottery(lottery_id)
         if not lot or lot["status"] != "active":
             await message.answer("❌ این قرعه‌کشی فعال نیست یا به پایان رسیده.")
             return
@@ -124,6 +52,81 @@ def setup_handlers(db: Database) -> Router:
         )
         await message.answer(text, reply_markup=join_confirm_kb(lottery_id))
 
+    @router.message(CommandStart())
+    async def cmd_start(message: Message, state: FSMContext, bot: Bot):
+        await state.clear()
+        user = message.from_user
+        if user is None: return
+
+        args = message.text.split()
+        payload = args[1] if len(args) > 1 else None
+
+        # ۱. اول چک عضویت کانال اجباری اصلی
+        if not await is_member(bot, user.id, REQUIRED_CHANNEL):
+            await message.answer(
+                f"⚠️ برای استفاده از ربات، ابتدا باید در کانال زیر عضو بشی:\n\n➡️ {REQUIRED_CHANNEL}\n\nبعد از عضویت، روی دکمه «✅ عضو شدم» بزن.",
+                reply_markup=join_channel_kb()
+            )
+            return
+
+        # ۲. ثبت کاربر در دیتابیس
+        try:
+            await db.upsert_user(user.id, user.username, user.first_name, user.last_name)
+            if user.id in ADMIN_IDS: await db.set_admin(user.id, True)
+        except Exception as e:
+            logger.exception(f"خطا در ثبت کاربر: {e}")
+            return
+
+        # ۳. بررسی لینک رفرال
+        ref_lottery_id = None
+        if payload and payload.startswith("ref_"):
+            parts = payload.replace("ref_", "").split("_")
+            if len(parts) >= 1:
+                try:
+                    referrer_id = int(parts[0])
+                    success = await db.set_referrer_if_empty(user.id, referrer_id)
+                    if success:
+                        try: await bot.send_message(referrer_id, "🎉 یکی از دوستانت با لینک تو وارد ربات شد و <b>۱ امتیاز</b> گرفتی!")
+                        except Exception: pass
+                except Exception as e:
+                    logger.exception(f"خطا در ثبت رفرال: {e}")
+            if len(parts) >= 2:
+                try: ref_lottery_id = int(parts[1])
+                except Exception: pass
+
+        # ۴. اگر با لینک قرعه‌کشی اومده بود (یا با لینک رفرال حاوی آیدی قرعه‌کشی)
+        target_lottery_id = None
+        if payload and payload.startswith("join_"):
+            try: target_lottery_id = int(payload.replace("join_", ""))
+            except Exception: pass
+        elif ref_lottery_id is not None:
+            target_lottery_id = ref_lottery_id
+
+        if target_lottery_id is not None:
+            await show_lottery_preview(message, target_lottery_id)
+            return
+
+        # ۵. منوی اصلی
+        await message.answer(
+            f"👋 سلام <b>{user.first_name}</b>!\n\nبه ربات <b>قرعه‌کشی</b> خوش آمدی.\nاز منوی زیر یک گزینه را انتخاب کن:",
+            reply_markup=main_menu_kb(),
+        )
+
+    @router.callback_query(F.data == "check_member")
+    async def cb_check_member(callback: CallbackQuery, bot: Bot):
+        if await is_member(bot, callback.from_user.id, REQUIRED_CHANNEL):
+            user = callback.from_user
+            try:
+                await db.upsert_user(user.id, user.username, user.first_name, user.last_name)
+                if user.id in ADMIN_IDS: await db.set_admin(user.id, True)
+            except Exception: pass
+            await callback.message.edit_text(
+                f"✅ عضویتت تأیید شد، خوش اومدی <b>{user.first_name}</b>!\n\nحالا می‌تونی از منوی زیر استفاده کنی یا دوباره روی لینک قرعه‌کشی کلیک کنی.",
+                reply_markup=main_menu_kb()
+            )
+        else:
+            await callback.answer("❌ هنوز عضو نشدی! اول عضو شو.", show_alert=True)
+
     @router.callback_query(F.data.startswith("do_join_"))
     async def cb_do_join(callback: CallbackQuery, bot: Bot):
         lottery_id = int(callback.data.replace("do_join_", ""))
@@ -132,14 +135,10 @@ def setup_handlers(db: Database) -> Router:
             await callback.answer("❌ این قرعه‌کشی فعال نیست.", show_alert=True)
             return
         channels = [c.strip() for c in lot["required_channels"].split(",") if c.strip()]
-        not_joined = []
-        for ch in channels:
-            if not await is_member(bot, callback.from_user.id, ch):
-                not_joined.append(ch)
+        not_joined = [ch for ch in channels if not await is_member(bot, callback.from_user.id, ch)]
         if not_joined:
             text = "⚠️ برای شرکت در این قرعه‌کشی، ابتدا باید در کانال‌های زیر عضو بشی:\n\n"
-            for ch in not_joined:
-                text += f"➡️ {ch}\n"
+            for ch in not_joined: text += f"➡️ {ch}\n"
             await callback.message.edit_text(text, reply_markup=must_join_channels_kb(not_joined, lottery_id))
             await callback.answer()
             return
@@ -153,25 +152,19 @@ def setup_handlers(db: Database) -> Router:
             await callback.answer("❌ این قرعه‌کشی فعال نیست.", show_alert=True)
             return
         channels = [c.strip() for c in lot["required_channels"].split(",") if c.strip()]
-        still_not_joined = []
-        for ch in channels:
-            if not await is_member(bot, callback.from_user.id, ch):
-                still_not_joined.append(ch)
+        still_not_joined = [ch for ch in channels if not await is_member(bot, callback.from_user.id, ch)]
         if still_not_joined:
             await callback.answer("❌ هنوز عضو همه کانال‌ها نشدی!", show_alert=True)
             return
         await process_join(callback, lottery_id, bot, callback.from_user.id, db)
 
-    # 🟢 ---- ثبت نام نهایی ----
     async def process_join(callback: CallbackQuery, lottery_id: int, bot: Bot, user_id: int, db_ref: Database):
         lot = await db_ref.get_lottery(lottery_id)
         result = await db_ref.join_lottery(lottery_id, user_id)
         
         if result == "ok":
             cnt = await db_ref.count_participants(lottery_id)
-            bot_info = await bot.get_me()
-            ref_link = f"https://t.me/{bot_info.username}?start=ref_{user_id}"
-            
+            ref_link = create_ref_link(user_id, lottery_id)
             text = (
                 f"🎉 با موفقیت در قرعه‌کشی #{lottery_id} ثبت‌نام شدی!\n\n"
                 f"👥 تعداد شرکت‌کنندگان: {cnt}\n\n"
@@ -185,13 +178,12 @@ def setup_handlers(db: Database) -> Router:
             await callback.answer("⚠️ قبلاً در این قرعه‌کشی ثبت‌نام کرده‌ای!", show_alert=True)
             await callback.message.edit_text("شما قبلاً ثبت‌نام کرده بودید.", reply_markup=back_to_menu_kb())
         elif result == "full":
-            await callback.answer("❌ ظرفیت این قرعه‌کشی پر شده است.", show_alert=True)
-            await callback.message.edit_text("متأسفانه ظرفیت پر شده.", reply_markup=back_to_menu_kb())
+            await callback.answer("❌ ظرفیت پر شده.", show_alert=True)
+            await callback.message.edit_text("ظرفیت پر شده.", reply_markup=back_to_menu_kb())
         elif result == "not_active":
-            await callback.answer("❌ این قرعه‌کشی فعال نیست.", show_alert=True)
-            await callback.message.edit_text("این قرعه‌کشی به پایان رسیده.", reply_markup=back_to_menu_kb())
+            await callback.answer("❌ قرعه‌کشی فعال نیست.", show_alert=True)
+            await callback.message.edit_text("قرعه‌کشی تمام شده.", reply_markup=back_to_menu_kb())
 
-    # 🟢 ---- منوها ----
     @router.message(Command("menu"))
     async def cmd_menu(message: Message, state: FSMContext, bot: Bot):
         await state.clear()
@@ -212,12 +204,8 @@ def setup_handlers(db: Database) -> Router:
 
     @router.callback_query(F.data == "stats")
     async def cb_stats(callback: CallbackQuery):
-        try:
-            s = await db.stats()
-        except Exception as e:
-            await callback.answer(f"❌ {type(e).__name__}: {e}", show_alert=True)
-            return
-        text = f"📊 <b>آمار ربات</b>\n\n👥 کاربران: <b>{s['users']}</b>\n🎁 کل قرعه‌کشی‌ها: <b>{s['lotteries']}</b>\n✅ فعال: <b>{s['active']}</b>\n🙋 شرکت‌کنندگان: <b>{s['participants']}</b>"
+        s = await db.stats()
+        text = f"📊 <b>آمار ربات</b>\n\n👥 کاربران: <b>{s['users']}</b>\n🎁 قرعه‌کشی‌ها: <b>{s['lotteries']}</b>\n✅ فعال: <b>{s['active']}</b>\n🙋 شرکت‌کنندگان: <b>{s['participants']}</b>"
         await callback.message.edit_text(text, reply_markup=back_to_menu_kb())
         await callback.answer()
 
@@ -227,7 +215,6 @@ def setup_handlers(db: Database) -> Router:
         await callback.message.edit_text(text, reply_markup=back_to_menu_kb())
         await callback.answer()
 
-    # 🟢 ---- ساخت قرعه‌کشی ----
     @router.callback_query(F.data == "create_lottery")
     async def cb_create_lottery(callback: CallbackQuery, state: FSMContext, bot: Bot):
         if not await is_member(bot, callback.from_user.id, REQUIRED_CHANNEL):
@@ -350,16 +337,11 @@ def setup_handlers(db: Database) -> Router:
         ends_at = datetime.now(timezone.utc) + timedelta(hours=float(data["duration_hours"]))
         try:
             lot_id = await db.create_lottery({
-                "owner_id": callback.from_user.id,
-                "winners_count": int(data["winners_count"]),
-                "prizes": data["prizes"],
-                "min_participants": int(data["min_participants"]),
-                "max_participants": int(data["max_participants"]),
-                "mode": data["mode"],
-                "required_channels": data["required_channels"],
-                "publish_channel": data["publish_channel"],
-                "post_text": data["post_text"],
-                "ends_at": ends_at,
+                "owner_id": callback.from_user.id, "winners_count": int(data["winners_count"]),
+                "prizes": data["prizes"], "min_participants": int(data["min_participants"]),
+                "max_participants": int(data["max_participants"]), "mode": data["mode"],
+                "required_channels": data["required_channels"], "publish_channel": data["publish_channel"],
+                "post_text": data["post_text"], "ends_at": ends_at,
             })
         except Exception as e:
             await callback.message.edit_text(f"❌ خطا:\n<code>{type(e).__name__}: {e}</code>")
@@ -377,12 +359,10 @@ def setup_handlers(db: Database) -> Router:
     @router.callback_query(F.data == "active_lotteries")
     async def cb_active_lotteries(callback: CallbackQuery):
         rows = await db.get_active_lotteries(limit=10)
-        if not rows:
-            text = "📋 هیچ قرعه‌کشی فعالی وجود ندارد."
+        if not rows: text = "📋 هیچ قرعه‌کشی فعالی وجود ندارد."
         else:
             lines = ["📋 <b>قرعه‌کشی‌های فعال:</b>\n"]
-            for r in rows:
-                lines.append(f"🎁 #{r['id']} — {r['winners_count']} برنده")
+            for r in rows: lines.append(f"🎁 #{r['id']} — {r['winners_count']} برنده")
             text = "\n".join(lines)
         await callback.message.edit_text(text, reply_markup=back_to_menu_kb())
         await callback.answer()
@@ -390,8 +370,7 @@ def setup_handlers(db: Database) -> Router:
     @router.callback_query(F.data == "my_lotteries")
     async def cb_my_lotteries(callback: CallbackQuery):
         rows = await db.get_user_lotteries(callback.from_user.id, limit=10)
-        if not rows:
-            text = "👤 هنوز قرعه‌کشی نساخته‌ای."
+        if not rows: text = "👤 هنوز قرعه‌کشی نساخته‌ای."
         else:
             lines = ["👤 <b>قرعه‌کشی‌های من:</b>\n"]
             for r in rows:
