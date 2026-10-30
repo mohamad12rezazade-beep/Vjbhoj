@@ -158,7 +158,7 @@ async def lottery_checker(bot: Bot) -> None:
 
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext, bot: Bot) -> None:
-    await state.clear() # 🟢 پاک کردن وضعیت قبلی
+    await state.clear()
     user = message.from_user
     if user is None:
         return
@@ -172,9 +172,6 @@ async def cmd_start(message: Message, state: FSMContext, bot: Bot) -> None:
         )
         return
 
-    args = message.text.split()
-    payload = args[1] if len(args) > 1 else None
-
     try:
         await db.upsert_user(user.id, user.username, user.first_name, user.last_name)
         if user.id in ADMIN_IDS:
@@ -183,21 +180,6 @@ async def cmd_start(message: Message, state: FSMContext, bot: Bot) -> None:
         logger.exception("خطا در ثبت کاربر: %s", e)
         await message.answer(f"❌ خطای دیتابیس:\n\n<code>{type(e).__name__}: {e}</code>")
         return
-
-    if payload and payload.startswith("ref_"):
-        try:
-            referrer_id = int(payload.replace("ref_", ""))
-            await db.set_referrer_if_empty(user.id, referrer_id)
-        except Exception:
-            pass
-
-    if payload and payload.startswith("join_"):
-        try:
-            lot_id = int(payload.replace("join_", ""))
-            await process_join(message, lot_id, bot, user.id, user.username)
-            return
-        except Exception as e:
-            logger.exception(f"خطا در join_ payload: {e}")
 
     await message.answer(
         f"👋 سلام <b>{user.first_name}</b>!\n\n"
@@ -226,7 +208,7 @@ async def cb_check_member(callback: CallbackQuery, bot: Bot) -> None:
 
 @router.message(Command("menu"))
 async def cmd_menu(message: Message, state: FSMContext, bot: Bot) -> None:
-    await state.clear() # 🟢 پاک کردن وضعیت
+    await state.clear()
     if not await is_member(bot, message.from_user.id):
         await message.answer("⚠️ اول در کانال عضو شو.", reply_markup=join_channel_kb())
         return
@@ -234,7 +216,7 @@ async def cmd_menu(message: Message, state: FSMContext, bot: Bot) -> None:
 
 @router.callback_query(F.data == "main_menu")
 async def cb_main_menu(callback: CallbackQuery, state: FSMContext, bot: Bot) -> None:
-    await state.clear() # 🟢 پاک کردن وضعیت
+    await state.clear()
     if not await is_member(bot, callback.from_user.id):
         await callback.message.edit_text("⚠️ اول در کانال عضو شو.", reply_markup=join_channel_kb())
         await callback.answer()
@@ -286,7 +268,6 @@ async def cb_create_lottery(callback: CallbackQuery, state: FSMContext, bot: Bot
     )
     await callback.answer()
 
-# 🟢 هندلرهای FSM ساخت قرعه‌کشی
 @router.message(CreateLottery.winners_count)
 async def step_winners(message: Message, state: FSMContext) -> None:
     try:
@@ -557,12 +538,38 @@ async def cb_my_lotteries(callback: CallbackQuery) -> None:
     await callback.message.edit_text(text, reply_markup=back_to_menu_kb())
     await callback.answer()
 
-# 🟢 این هندلر باید دقیقا آخر همه باشه و مزاحم FSM نشه
+# 🟢 این هندلر طلاییه! اگه استیت لود نشد، وقتی کاربر فقط یه عدد فرستاد، خودش می‌فهمه که تو مرحله ۱ هستیم
+@router.message(F.text.regexp(r"^\d+$"))
+async def fallback_number_handler(message: Message, state: FSMContext) -> None:
+    current_state = await state.get_state()
+    if current_state is not None:
+        return # اگه استیت درست لود شده بود، اینجا کاری نکنه بذاره هندلر اصلی کارش رو بکنه
+    
+    # اگه استیت نال بود (باگ تاخیر دیتابیس) و کاربر عدد فرستاد، خودمون میریم مرحله ۲
+    try:
+        n = int(message.text.strip())
+        if n <= 0: raise ValueError
+    except:
+        await message.answer("❌ یک عدد مثبت بفرست.")
+        return
+    await state.update_data(winners_count=n)
+    await state.set_state(CreateLottery.prizes)
+    await message.answer(
+        f"✅ تعداد برندگان: <b>{n}</b>\n\n"
+        "🎁 <b>مرحله ۲ از ۱۰</b>\n\n"
+        "جوایز رو بنویس (هر جایزه در یک خط):",
+        reply_markup=cancel_kb()
+    )
+
+@router.callback_query()
+async def cb_fallback(callback: CallbackQuery) -> None:
+    await callback.answer("این دکمه هنوز فعال نشده.", show_alert=True)
+
 @router.message()
 async def msg_fallback(message: Message, state: FSMContext) -> None:
     current_state = await state.get_state()
     if current_state is not None:
-        return # اگه تو مرحله ساخت بود، کاری نکن
+        return 
     await message.answer("متوجه نشدم. از /menu استفاده کن.")
 
 async def main() -> None:
