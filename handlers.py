@@ -19,6 +19,10 @@ from states import CreateLottery
 logger = logging.getLogger("lottery-bot")
 REQUIRED_CHANNEL = "@BET_1XZX"
 
+# حافظه موقت برای ذخیره پارامترهای رفرالِ کاربرانی که هنوز عضو کانال نشدن
+# ساختار: {user_id: {"referrer_id": int, "lottery_id": int}}
+pending_refs = {}
+
 def join_channel_kb():
     builder = InlineKeyboardBuilder()
     builder.row(InlineKeyboardButton(text="📢 عضویت در کانال", url=f"https://t.me/{REQUIRED_CHANNEL.replace('@', '')}"))
@@ -52,6 +56,23 @@ def setup_handlers(db: Database) -> Router:
         )
         await message.answer(text, reply_markup=join_confirm_kb(lottery_id))
 
+    async def apply_referral(bot: Bot, user_id: int, referrer_id: int) -> bool:
+        """ثبت امتیاز به دعوت‌کننده و پیام دادن بهش"""
+        try:
+            success = await db.set_referrer_if_empty(user_id, referrer_id)
+            if success:
+                try:
+                    await bot.send_message(
+                        referrer_id,
+                        "🎉 یکی از دوستانت با لینک تو وارد ربات شد و <b>۱ امتیاز</b> گرفتی!"
+                    )
+                except Exception as e:
+                    logger.warning(f"نتونستم به دعوت‌کننده پیام بدم: {e}")
+            return success
+        except Exception as e:
+            logger.exception(f"خطا در ثبت رفرال: {e}")
+            return False
+
     @router.message(CommandStart())
     async def cmd_start(message: Message, state: FSMContext, bot: Bot):
         await state.clear()
@@ -61,15 +82,32 @@ def setup_handlers(db: Database) -> Router:
         args = message.text.split()
         payload = args[1] if len(args) > 1 else None
 
-        # ۱. اول چک عضویت کانال اجباری اصلی
+        # استخراج آیدی دعوت‌کننده و آیدی قرعه‌کشی از لینک
+        referrer_id = None
+        target_lottery_id = None
+        if payload:
+            if payload.startswith("ref_"):
+                parts = payload.replace("ref_", "").split("_")
+                try: referrer_id = int(parts[0])
+                except Exception: pass
+                if len(parts) >= 2:
+                    try: target_lottery_id = int(parts[1])
+                    except Exception: pass
+            elif payload.startswith("join_"):
+                try: target_lottery_id = int(payload.replace("join_", ""))
+                except Exception: pass
+
+        # اگه کاربر عضو کانال اجباری نیست، پارامترها رو ذخیره کن و بفرستش عضو شه
         if not await is_member(bot, user.id, REQUIRED_CHANNEL):
+            if referrer_id or target_lottery_id:
+                pending_refs[user.id] = {"referrer_id": referrer_id, "lottery_id": target_lottery_id}
             await message.answer(
                 f"⚠️ برای استفاده از ربات، ابتدا باید در کانال زیر عضو بشی:\n\n➡️ {REQUIRED_CHANNEL}\n\nبعد از عضویت، روی دکمه «✅ عضو شدم» بزن.",
                 reply_markup=join_channel_kb()
             )
             return
 
-        # ۲. ثبت کاربر در دیتابیس
+        # کاربر عضو هست، ثبتش کن
         try:
             await db.upsert_user(user.id, user.username, user.first_name, user.last_name)
             if user.id in ADMIN_IDS: await db.set_admin(user.id, True)
@@ -77,36 +115,15 @@ def setup_handlers(db: Database) -> Router:
             logger.exception(f"خطا در ثبت کاربر: {e}")
             return
 
-        # ۳. بررسی لینک رفرال
-        ref_lottery_id = None
-        if payload and payload.startswith("ref_"):
-            parts = payload.replace("ref_", "").split("_")
-            if len(parts) >= 1:
-                try:
-                    referrer_id = int(parts[0])
-                    success = await db.set_referrer_if_empty(user.id, referrer_id)
-                    if success:
-                        try: await bot.send_message(referrer_id, "🎉 یکی از دوستانت با لینک تو وارد ربات شد و <b>۱ امتیاز</b> گرفتی!")
-                        except Exception: pass
-                except Exception as e:
-                    logger.exception(f"خطا در ثبت رفرال: {e}")
-            if len(parts) >= 2:
-                try: ref_lottery_id = int(parts[1])
-                except Exception: pass
+        # اگه رفرال داشت، امتیاز رو ثبت کن
+        if referrer_id:
+            await apply_referral(bot, user.id, referrer_id)
 
-        # ۴. اگر با لینک قرعه‌کشی اومده بود (یا با لینک رفرال حاوی آیدی قرعه‌کشی)
-        target_lottery_id = None
-        if payload and payload.startswith("join_"):
-            try: target_lottery_id = int(payload.replace("join_", ""))
-            except Exception: pass
-        elif ref_lottery_id is not None:
-            target_lottery_id = ref_lottery_id
-
+        # اگه باید بره سراغ قرعه‌کشی، برو
         if target_lottery_id is not None:
             await show_lottery_preview(message, target_lottery_id)
             return
 
-        # ۵. منوی اصلی
         await message.answer(
             f"👋 سلام <b>{user.first_name}</b>!\n\nبه ربات <b>قرعه‌کشی</b> خوش آمدی.\nاز منوی زیر یک گزینه را انتخاب کن:",
             reply_markup=main_menu_kb(),
@@ -114,18 +131,32 @@ def setup_handlers(db: Database) -> Router:
 
     @router.callback_query(F.data == "check_member")
     async def cb_check_member(callback: CallbackQuery, bot: Bot):
-        if await is_member(bot, callback.from_user.id, REQUIRED_CHANNEL):
-            user = callback.from_user
-            try:
-                await db.upsert_user(user.id, user.username, user.first_name, user.last_name)
-                if user.id in ADMIN_IDS: await db.set_admin(user.id, True)
-            except Exception: pass
-            await callback.message.edit_text(
-                f"✅ عضویتت تأیید شد، خوش اومدی <b>{user.first_name}</b>!\n\nحالا می‌تونی از منوی زیر استفاده کنی یا دوباره روی لینک قرعه‌کشی کلیک کنی.",
-                reply_markup=main_menu_kb()
-            )
-        else:
+        user = callback.from_user
+        if not await is_member(bot, user.id, REQUIRED_CHANNEL):
             await callback.answer("❌ هنوز عضو نشدی! اول عضو شو.", show_alert=True)
+            return
+
+        # ثبت کاربر
+        try:
+            await db.upsert_user(user.id, user.username, user.first_name, user.last_name)
+            if user.id in ADMIN_IDS: await db.set_admin(user.id, True)
+        except Exception: pass
+
+        # چک کن آیا پارامتر رفرالی ذخیره شده براش
+        pending = pending_refs.pop(user.id, None)
+        if pending and pending.get("referrer_id"):
+            await apply_referral(bot, user.id, pending["referrer_id"])
+
+        # اگه باید بره سراغ قرعه‌کشی، برو
+        if pending and pending.get("lottery_id"):
+            await callback.message.edit_text("✅ عضویتت تأیید شد! در حال رفتن به قرعه‌کشی...")
+            await show_lottery_preview(callback.message, pending["lottery_id"])
+            return
+
+        await callback.message.edit_text(
+            f"✅ عضویتت تأیید شد، خوش اومدی <b>{user.first_name}</b>!\n\nاز منوی زیر انتخاب کن:",
+            reply_markup=main_menu_kb()
+        )
 
     @router.callback_query(F.data.startswith("do_join_"))
     async def cb_do_join(callback: CallbackQuery, bot: Bot):
@@ -142,7 +173,7 @@ def setup_handlers(db: Database) -> Router:
             await callback.message.edit_text(text, reply_markup=must_join_channels_kb(not_joined, lottery_id))
             await callback.answer()
             return
-        await process_join(callback, lottery_id, bot, callback.from_user.id, db)
+        await process_join(callback, lottery_id, bot, callback.from_user.id)
 
     @router.callback_query(F.data.startswith("check_lottery_member_"))
     async def cb_check_lottery_member(callback: CallbackQuery, bot: Bot):
@@ -156,21 +187,22 @@ def setup_handlers(db: Database) -> Router:
         if still_not_joined:
             await callback.answer("❌ هنوز عضو همه کانال‌ها نشدی!", show_alert=True)
             return
-        await process_join(callback, lottery_id, bot, callback.from_user.id, db)
+        await process_join(callback, lottery_id, bot, callback.from_user.id)
 
-    async def process_join(callback: CallbackQuery, lottery_id: int, bot: Bot, user_id: int, db_ref: Database):
-        lot = await db_ref.get_lottery(lottery_id)
-        result = await db_ref.join_lottery(lottery_id, user_id)
+    async def process_join(callback: CallbackQuery, lottery_id: int, bot: Bot, user_id: int):
+        lot = await db.get_lottery(lottery_id)
+        result = await db.join_lottery(lottery_id, user_id)
         
         if result == "ok":
-            cnt = await db_ref.count_participants(lottery_id)
+            cnt = await db.count_participants(lottery_id)
             ref_link = create_ref_link(user_id, lottery_id)
             text = (
                 f"🎉 با موفقیت در قرعه‌کشی #{lottery_id} ثبت‌نام شدی!\n\n"
                 f"👥 تعداد شرکت‌کنندگان: {cnt}\n\n"
                 f"🌟 <b>+۱ امتیاز</b> بابت شرکت در قرعه‌کشی گرفتی!\n\n"
                 f"🔗 <b>لینک دعوت اختصاصی تو:</b>\n{ref_link}\n\n"
-                f"🎯 با هر بار دعوت از دوستانت، <b>۱ امتیاز</b> دیگه هم می‌گیری."
+                f"🎯 با هر بار دعوت از دوستانت، <b>۱ امتیاز</b> دیگه هم می‌گیری.\n"
+                f"⚠️ هرکسی که با لینک تو بیاد، به صورت خودکار وارد همین قرعه‌کشی می‌شه."
             )
             await callback.message.edit_text(text, reply_markup=back_to_menu_kb())
             await callback.answer("ثبت‌نام شدی و ۱ امتیاز گرفتی! 🎉")
