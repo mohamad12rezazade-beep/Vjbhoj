@@ -9,12 +9,13 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
+from aiogram.fsm.storage.memory import MemoryStorage  # 👈 استفاده از حافظه موقت
 from aiogram.types import CallbackQuery, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.types import InlineKeyboardButton
 
 from config import BOT_TOKEN, DATABASE_URL, ADMIN_IDS
-from database import Database, PostgresStorage
+from database import Database  # دیگه PostgresStorage رو ایمپورت نمی‌کنیم
 from keyboards import (
     main_menu_kb, back_to_menu_kb, cancel_kb, confirm_lottery_kb,
     join_lottery_inline_kb, lottery_join_kb
@@ -87,12 +88,9 @@ async def init_db() -> None:
                 user_id BIGINT PRIMARY KEY,
                 state TEXT,
                 data JSONB NOT NULL DEFAULT '{}'::jsonb,
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                temp_flag TEXT
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
         """)
-        # این خط خودش ستون رو به جدول اضافه میکنه اگه نبود
-        await conn.execute("ALTER TABLE fsm_states ADD COLUMN IF NOT EXISTS temp_flag TEXT;")
         logger.info("✅ جدول‌ها آماده هستند.")
 
 async def is_member(bot: Bot, user_id: int) -> bool:
@@ -277,34 +275,16 @@ async def cb_create_lottery(callback: CallbackQuery, state: FSMContext, bot: Bot
 @router.message(CreateLottery.winners_count)
 async def step_winners(message: Message, state: FSMContext) -> None:
     try:
-        n = int(message.text.strip())
-        if n <= 0: raise ValueError
-    except:
-        await message.answer("❌ یک عدد مثبت بفرست.")
-        return
-    await state.update_data(winners_count=n)
-    await state.set_state(CreateLottery.prizes)
-    await message.answer(
-        f"✅ تعداد برندگان: <b>{n}</b>\n\n"
-        "🎁 <b>مرحله ۲ از ۱۰</b>\n\n"
-        "جوایز رو بنویس (هر جایزه در یک خط):",
-        reply_markup=cancel_kb()
-    )
-
-# 🟢 ---- هندلر نجات‌دهنده (Fallback for numbers) ----
-@router.message(F.text.regexp(r"^\d+$"))
-async def fallback_number_handler(message: Message, state: FSMContext) -> None:
-    current_state = await state.get_state()
-    if current_state is not None:
-        return 
-    
-    try:
-        n = int(message.text.strip())
-        if n <= 0: raise ValueError
-    except:
-        await message.answer("❌ یک عدد مثبت بفرست.")
-        return
+        # تبدیل اعداد فارسی به انگلیسی
+        text = message.text.strip()
+        text = text.replace("۱", "1").replace("۲", "2").replace("۳", "3").replace("۴", "4").replace("۵", "5").replace("۶", "6").replace("۷", "7").replace("۸", "8").replace("۹", "9").replace("۰", "0")
+        text = text.replace("يك", "1").replace("يك", "1") # اگر اشتباهی نوشت
         
+        n = int(text)
+        if n <= 0: raise ValueError
+    except:
+        await message.answer("❌ یک عدد مثبت بفرست (مثلاً 1).")
+        return
     await state.update_data(winners_count=n)
     await state.set_state(CreateLottery.prizes)
     await message.answer(
@@ -326,10 +306,12 @@ async def step_prizes(message: Message, state: FSMContext) -> None:
 @router.message(CreateLottery.min_participants)
 async def step_min(message: Message, state: FSMContext) -> None:
     try:
-        n = int(message.text.strip())
+        text = message.text.strip()
+        text = text.replace("۱", "1").replace("۲", "2").replace("۳", "3").replace("۴", "4").replace("۵", "5").replace("۶", "6").replace("۷", "7").replace("۸", "8").replace("۹", "9").replace("۰", "0")
+        n = int(text)
         if n <= 0: raise ValueError
     except:
-        await message.answer("❌ یک عدد مثبت بفرست.")
+        await message.answer("❌ یک عدد مثبت بفرست (مثلاً 5).")
         return
     await state.update_data(min_participants=n)
     await state.set_state(CreateLottery.max_participants)
@@ -342,7 +324,9 @@ async def step_min(message: Message, state: FSMContext) -> None:
 @router.message(CreateLottery.max_participants)
 async def step_max(message: Message, state: FSMContext) -> None:
     try:
-        n = int(message.text.strip())
+        text = message.text.strip()
+        text = text.replace("۱", "1").replace("۲", "2").replace("۳", "3").replace("۴", "4").replace("۵", "5").replace("۶", "6").replace("۷", "7").replace("۸", "8").replace("۹", "9").replace("۰", "0")
+        n = int(text)
     except:
         await message.answer("❌ یک عدد بفرست.")
         return
@@ -361,10 +345,12 @@ async def step_max(message: Message, state: FSMContext) -> None:
 @router.message(CreateLottery.duration)
 async def step_duration(message: Message, state: FSMContext) -> None:
     try:
-        h = float(message.text.strip())
+        text = message.text.strip()
+        text = text.replace("۱", "1").replace("۲", "2").replace("۳", "3").replace("۴", "4").replace("۵", "5").replace("۶", "6").replace("۷", "7").replace("۸", "8").replace("۹", "9").replace("۰", "0")
+        h = float(text)
         if h <= 0: raise ValueError
     except:
-        await message.answer("❌ یک عدد مثبت (ساعت) بفرست.")
+        await message.answer("❌ یک عدد مثبت (ساعت) بفرست (مثلاً 24).")
         return
     await state.update_data(duration_hours=h)
     await state.set_state(CreateLottery.mode)
@@ -385,7 +371,7 @@ async def step_mode(message: Message, state: FSMContext) -> None:
     await state.set_state(CreateLottery.required_channels)
     await message.answer(
         f"✅ روش: <b>{mode}</b>\n\n"
-        "📢 <b>مرحله ۷ از ۱۰</b>\n\nکانال‌های عضویت اجباری رو با کاما جدا کن:",
+        "📢 <b>مرحله ۷ از ۱۰</b>\n\nکانال‌های عضویت اجباری رو با کاما جدا کن (مثلاً @channel1,@channel2):",
         reply_markup=cancel_kb()
     )
 
@@ -407,7 +393,7 @@ async def step_publish(message: Message, state: FSMContext, bot: Bot) -> None:
     try:
         await bot.get_chat(ch)
     except Exception:
-        await message.answer("❌ ربات به این کانال دسترسی نداره. ادمینش کن.")
+        await message.answer("❌ ربات به این کانال دسترسی نداره. مطمئن شو ادمینش کردی.")
         return
     await state.update_data(publish_channel=ch)
     await state.set_state(CreateLottery.post_text)
@@ -591,7 +577,8 @@ async def main() -> None:
         token=BOT_TOKEN,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
-    dp = Dispatcher(storage=PostgresStorage(db))
+    # 🟢 اینجا حافظه موقت استفاده میشه، دیگه گیر دیتابیس نمی‌کنیم
+    dp = Dispatcher(storage=MemoryStorage()) 
     dp.include_router(router)
 
     asyncio.create_task(lottery_checker(bot))
