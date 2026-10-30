@@ -1,6 +1,5 @@
 from aiogram.fsm.state import State, StatesGroup
 
-
 class CreateLottery(StatesGroup):
     winners_count = State()
     prizes = State()
