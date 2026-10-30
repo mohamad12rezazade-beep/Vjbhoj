@@ -1,23 +1,32 @@
 import os
+from dataclasses import dataclass
+
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# توکن ربات تلگرام
-BOT_TOKEN = os.getenv("BOT_TOKEN")
 
-# آدرس اتصال PostgreSQL
-DATABASE_URL = os.getenv("DATABASE_URL")
+def _require(name: str) -> str:
+    value = os.getenv(name)
+    if not value:
+        raise RuntimeError(f"متغیر محیطی {name} تنظیم نشده است.")
+    return value
 
-# شناسه ادمین‌های ربات
-ADMIN_IDS = [
-    int(user_id)
-    for user_id in os.getenv("ADMIN_IDS", "").split(",")
-    if user_id.strip()
-]
 
-if not BOT_TOKEN:
-    raise ValueError("BOT_TOKEN تنظیم نشده است!")
+@dataclass(frozen=True)
+class Config:
+    bot_token: str
+    database_url: str
+    # آیدی عددی ادمین اصلی (اولین ادمین)
+    super_admin_id: int
 
-if not DATABASE_URL:
-    raise ValueError("DATABASE_URL تنظیم نشده است!")
+
+def load_config() -> Config:
+    return Config(
+        bot_token=_require("BOT_TOKEN"),
+        database_url=_require("DATABASE_URL"),
+        super_admin_id=int(os.getenv("SUPER_ADMIN_ID", "0")),
+    )
+
+
+config = load_config()
