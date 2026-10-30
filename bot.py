@@ -12,7 +12,6 @@ from aiogram.types import CallbackQuery, Message
 from config import BOT_TOKEN, DATABASE_URL, ADMIN_IDS
 from database import Database, PostgresStorage
 from keyboards import main_menu_kb, back_to_menu_kb
-from states import CreateLottery
 
 # ------------------- لاگ -------------------
 logging.basicConfig(
@@ -27,25 +26,35 @@ db = Database(DATABASE_URL)
 router = Router()
 
 
-# ------------------- توابع کمکی -------------------
+# ------------------- بازسازی کامل دیتابیس -------------------
 async def init_db() -> None:
-    """ساخت خودکار تمام جدول‌های ضروری در صورت نبودن"""
+    """پاک‌سازی و ساخت مجدد تمام جدول‌ها با ساختار صحیح"""
     async with db.pool.acquire() as conn:
+        # ⚠️ این خط جدول‌های قدیمی رو پاک می‌کنه (چون تازه‌کاری و داده مهمی نیست)
         await conn.execute("""
-            CREATE TABLE IF NOT EXISTS users (
+            DROP TABLE IF EXISTS winners CASCADE;
+            DROP TABLE IF EXISTS participants CASCADE;
+            DROP TABLE IF EXISTS lotteries CASCADE;
+            DROP TABLE IF EXISTS fsm_states CASCADE;
+            DROP TABLE IF EXISTS users CASCADE;
+        """)
+
+        # ساخت از نو
+        await conn.execute("""
+            CREATE TABLE users (
                 user_id BIGINT PRIMARY KEY,
                 username TEXT,
                 first_name TEXT,
                 last_name TEXT,
                 is_admin BOOLEAN NOT NULL DEFAULT FALSE,
                 points INTEGER NOT NULL DEFAULT 0,
-                referred_by BIGINT REFERENCES users(user_id) ON DELETE SET NULL,
+                referred_by BIGINT,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
 
-            CREATE TABLE IF NOT EXISTS lotteries (
+            CREATE TABLE lotteries (
                 id BIGSERIAL PRIMARY KEY,
-                owner_id BIGINT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+                owner_id BIGINT NOT NULL,
                 winners_count INTEGER NOT NULL CHECK (winners_count > 0),
                 prizes TEXT NOT NULL,
                 min_participants INTEGER NOT NULL DEFAULT 1,
@@ -61,7 +70,7 @@ async def init_db() -> None:
                 finished_at TIMESTAMPTZ
             );
 
-            CREATE TABLE IF NOT EXISTS participants (
+            CREATE TABLE participants (
                 id BIGSERIAL PRIMARY KEY,
                 lottery_id BIGINT NOT NULL REFERENCES lotteries(id) ON DELETE CASCADE,
                 user_id BIGINT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
@@ -69,7 +78,7 @@ async def init_db() -> None:
                 UNIQUE(lottery_id, user_id)
             );
 
-            CREATE TABLE IF NOT EXISTS winners (
+            CREATE TABLE winners (
                 id BIGSERIAL PRIMARY KEY,
                 lottery_id BIGINT NOT NULL REFERENCES lotteries(id) ON DELETE CASCADE,
                 user_id BIGINT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
@@ -79,14 +88,14 @@ async def init_db() -> None:
                 UNIQUE(lottery_id, user_id)
             );
 
-            CREATE TABLE IF NOT EXISTS fsm_states (
+            CREATE TABLE fsm_states (
                 user_id BIGINT PRIMARY KEY,
                 state TEXT,
                 data JSONB NOT NULL DEFAULT '{}'::jsonb,
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
         """)
-        logger.info("همه جدول‌ها آماده هستند.")
+        logger.info("✅ تمام جدول‌ها از نو ساخته شدند.")
 
 
 # ------------------- هندلرها -------------------
@@ -102,7 +111,11 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
             await db.set_admin(user.id, True)
     except Exception as e:
         logger.exception("خطا در ثبت کاربر: %s", e)
-        await message.answer("❌ خطای داخلی. لطفاً بعداً امتحان کن.")
+        # نمایش دقیق خطا به کاربر برای عیب‌یابی
+        await message.answer(
+            f"❌ خطای دیتابیس:\n\n<code>{type(e).__name__}: {e}</code>",
+            parse_mode="HTML"
+        )
         return
 
     await message.answer(
@@ -134,7 +147,7 @@ async def cb_stats(callback: CallbackQuery) -> None:
         s = await db.stats()
     except Exception as e:
         logger.exception("خطا در آمار: %s", e)
-        await callback.answer("❌ خطا در دریافت آمار", show_alert=True)
+        await callback.answer(f"❌ {type(e).__name__}: {e}", show_alert=True)
         return
 
     text = (
@@ -179,7 +192,7 @@ async def cb_active_lotteries(callback: CallbackQuery) -> None:
         rows = await db.get_active_lotteries(limit=10)
     except Exception as e:
         logger.exception("خطا در لیست فعال: %s", e)
-        await callback.answer("❌ خطا", show_alert=True)
+        await callback.answer(f"❌ {type(e).__name__}: {e}", show_alert=True)
         return
 
     if not rows:
@@ -199,7 +212,7 @@ async def cb_my_lotteries(callback: CallbackQuery) -> None:
         rows = await db.get_user_lotteries(callback.from_user.id, limit=10)
     except Exception as e:
         logger.exception("خطا در قرعه‌کشی‌های من: %s", e)
-        await callback.answer("❌ خطا", show_alert=True)
+        await callback.answer(f"❌ {type(e).__name__}: {e}", show_alert=True)
         return
 
     if not rows:
@@ -229,10 +242,10 @@ async def main() -> None:
     logger.info("در حال اتصال به دیتابیس...")
     await db.connect()
     
-    logger.info("در حال ساخت جدول‌ها...")
+    logger.info("در حال پاک‌سازی و ساخت مجدد جدول‌ها...")
     await init_db()
 
-    logger.info("اتصال برقرار شد. شروع پولینگ...")
+    logger.info("✅ همه چیز آماده است. شروع پولینگ...")
 
     bot = Bot(
         token=BOT_TOKEN,
