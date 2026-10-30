@@ -41,9 +41,13 @@ def join_confirm_kb(lottery_id: int) -> InlineKeyboardMarkup:
     )
     return builder.as_markup()
 
-def must_join_channels_kb(channels: list[str]) -> InlineKeyboardMarkup:
+def must_join_channels_kb(channels: list[str], lottery_id: int) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     for ch in channels:
         builder.row(InlineKeyboardButton(text=f"📢 عضویت در {ch}", url=f"https://t.me/{ch.replace('@', '')}"))
-    builder.row(InlineKeyboardButton(text="✅ عضو شدم", callback_data="check_join_membership"))
+    builder.row(InlineKeyboardButton(text="✅ عضو شدم", callback_data=f"check_lottery_member_{lottery_id}"))
     return builder.as_markup()
+
+def create_ref_link(user_id: int, lottery_id: int) -> str:
+    # 🟢 لینک رفرال حالا آیدی قرعه‌کشی رو هم داره
+    return f"https://t.me/{BOT_USERNAME}?start=ref_{user_id}_{lottery_id}"
